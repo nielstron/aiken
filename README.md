@@ -33,6 +33,26 @@ $ cargo install --git https://github.com/aiken-lang/aiken.git
 $ aiken --help
 ```
 
+#### Nix Users:
+
+If you use the nix package manager, try the following commands to get started:
+
+```bash
+# Enter development environment with rust, cargo, etc.
+nix develop .#aiken
+# Run help
+cargo run -- help
+
+# Build directly without entering development environment
+nix build .#aiken
+
+# Run directly from nix
+nix run .#aiken
+
+# Run directly, get help
+nix run .#aiken -- help
+```
+
 ### How to use
 
 For more information please see the [user manual](https://aiken-lang.org).
