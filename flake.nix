@@ -1,3 +1,4 @@
+# Update with 'nix run github:cargo2nix/cargo2nix'
 {
   inputs = {
     cargo2nix.url = "github:cargo2nix/cargo2nix/release-0.11.0";
