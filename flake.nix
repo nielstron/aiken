@@ -20,7 +20,6 @@
 
       in rec {
         packages = {
-          # replace hello-world with your package name
           aiken = (rustPkgs.workspace.aiken {}).bin;
           default = packages.aiken;
         };
