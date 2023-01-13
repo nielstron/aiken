@@ -33,7 +33,7 @@ $ cargo install --git https://github.com/aiken-lang/aiken.git
 $ aiken --help
 ```
 
-Alternatively nix users are able to use [flakes](https://aiken-lang.org/nix-flakes)
+Alternatively nix users are able to use [flakes](https://aiken-lang.org/getting-started#from-nix-flakes)
 
 ### How to use
 
