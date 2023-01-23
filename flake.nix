@@ -33,9 +33,36 @@
         commonCategory = y: builtins.map (x: x // { category = y; });
       in rec {
         packages = {
-          aiken = (rustPkgs.workspace.aiken { }).bin;
-          default = packages.aiken;
+          aik = (rustPkgs.workspace.aiken { }).bin;
+          default = packages.aik;
         };
+        rustCmds = commonCategory "Rust Development" [
+            {
+              name = "rust-format-all";
+              command = "cargo run --";
+              help = "Formats all rust source code";
+              # package = packages.aiken;
+            }
+            {
+              name = "uplcx";
+              command = "cargo run -- uplc";
+              help = "Formats all rust source code";
+              # package = packages.aiken;
+            }
+          ];
+        aikenCmds = commonCategory "Aiken Development" [
+            {
+              name = "aiken";
+              help = "Aiken toolchain";
+              package = packages.aik;
+            }
+            {
+              name = "uplc";
+              command = "aiken uplc";
+              help = "Shorthand for aiken uplc";
+              # package = packages.aiken;
+            }
+          ];
         devShell = pkgs.devshell.mkShell {
           # shell = (rustPkgs.workspace.aiken { }).bin;
           name = "aiken";
@@ -43,33 +70,22 @@
 
             ${logo} {bold}AIKEN
                         $(type -p menu &>/dev/null && menu)'';
-          commands = commonCategory "Rust Development" [
-            {
-              name = "rust-format-all";
-              command = "cargo run --";
-              help = "Formats all rust source code";
-              package = packages.aiken;
-            }
-            {
-              name = "uplc";
-              command = "cargo run -- uplc";
-              help = "Formats all rust source code";
-              package = packages.aiken;
-            }
-          ] ++ commonCategory "Aiken Development" [
-            {
-              name = "aiken-fmt";
-              command = "blah";
-              help = "Formats all aiken source code";
-              package = packages.aiken;
-            }
-            {
-              name = "uplc";
-              command = "blah";
-              help = "Shorthand for aiken uplc";
-              package = packages.aiken;
-            }
-          ];
+          commands = aikenCmds;
+        };
+        devShells.aiken = devShell;
+        devShells.cargo = pkgs.devshell.mkShell {
+          # shell = (rustPkgs.workspace.aiken { }).bin;
+          name = "cargo";
+          motd = ''Cargo Utilities
+                        $(type -p menu &>/dev/null && menu)'';
+          commands = rustCmds;
+        };
+        devShells.all = pkgs.devshell.mkShell {
+          # shell = (rustPkgs.workspace.aiken { }).bin;
+          name = "aiken+cargo";
+          motd = ''Aiken & Cargo Utilities
+                        $(type -p menu &>/dev/null && menu)'';
+          commands = aikenCmds ++ rustCmds;
         };
       });
 }
