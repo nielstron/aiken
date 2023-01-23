@@ -1,4 +1,4 @@
-use crate::{pretty, script::EvalHint};
+use crate::{deps::manifest::Package, package_name::PackageName, pretty, script::EvalHint};
 use aiken_lang::{
     ast::{BinOp, Span},
     parser::error::ParseError,
@@ -106,6 +106,14 @@ pub enum Error {
         src: String,
         evaluation_hint: Option<EvalHint>,
     },
+
+    #[error(
+        "I was unable to resolve '{}' for {}/{}",
+        package.version,
+        package.name.owner,
+        package.name.repo
+    )]
+    UnknownPackageVersion { package: Package },
 }
 
 impl Error {
@@ -187,6 +195,7 @@ impl Error {
             Error::Http(_) => None,
             Error::ZipExtract(_) => None,
             Error::JoinError(_) => None,
+            Error::UnknownPackageVersion { .. } => None,
         }
     }
 
@@ -208,6 +217,7 @@ impl Error {
             Error::Http(_) => None,
             Error::ZipExtract(_) => None,
             Error::JoinError(_) => None,
+            Error::UnknownPackageVersion { .. } => None,
         }
     }
 }
@@ -244,7 +254,7 @@ impl Diagnostic for Error {
             Error::List(_) => None,
             Error::Parse { .. } => Some(Box::new("aiken::parser")),
             Error::Type { error, .. } => Some(Box::new(format!(
-                "err::aiken::check{}",
+                "aiken::check{}",
                 error.code().map(|s| format!("::{s}")).unwrap_or_default()
             ))),
             Error::StandardIo(_) => None,
@@ -254,9 +264,10 @@ impl Diagnostic for Error {
             Error::ValidatorMustReturnBool { .. } => Some(Box::new("aiken::scripts")),
             Error::WrongValidatorArity { .. } => Some(Box::new("aiken::validators")),
             Error::TestFailure { path, .. } => Some(Box::new(path.to_str().unwrap_or(""))),
-            Error::Http(_) => Some(Box::new("aiken::deps")),
+            Error::Http(_) => Some(Box::new("aiken::packages::download")),
             Error::ZipExtract(_) => None,
             Error::JoinError(_) => None,
+            Error::UnknownPackageVersion { .. } => Some(Box::new("aiken::packages::resolve")),
         }
     }
 
@@ -312,6 +323,7 @@ impl Diagnostic for Error {
             Error::Http(_) => None,
             Error::ZipExtract(_) => None,
             Error::JoinError(_) => None,
+            Error::UnknownPackageVersion{..} => Some(Box::new("Perhaps, double-check the package repository and version?")),
         }
     }
 
@@ -345,6 +357,7 @@ impl Diagnostic for Error {
             Error::Http(_) => None,
             Error::ZipExtract(_) => None,
             Error::JoinError(_) => None,
+            Error::UnknownPackageVersion { .. } => None,
         }
     }
 
@@ -366,6 +379,7 @@ impl Diagnostic for Error {
             Error::Http(_) => None,
             Error::ZipExtract(_) => None,
             Error::JoinError(_) => None,
+            Error::UnknownPackageVersion { .. } => None,
         }
     }
 
@@ -387,6 +401,29 @@ impl Diagnostic for Error {
             Error::Http { .. } => None,
             Error::ZipExtract { .. } => None,
             Error::JoinError { .. } => None,
+            Error::UnknownPackageVersion { .. } => None,
+        }
+    }
+
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
+        match self {
+            Error::DuplicateModule { .. } => None,
+            Error::FileIo { .. } => None,
+            Error::ImportCycle { .. } => None,
+            Error::List { .. } => None,
+            Error::Parse { .. } => None,
+            Error::Type { error, .. } => error.related(),
+            Error::StandardIo(_) => None,
+            Error::MissingManifest { .. } => None,
+            Error::TomlLoading { .. } => None,
+            Error::Format { .. } => None,
+            Error::ValidatorMustReturnBool { .. } => None,
+            Error::WrongValidatorArity { .. } => None,
+            Error::TestFailure { .. } => None,
+            Error::Http { .. } => None,
+            Error::ZipExtract { .. } => None,
+            Error::JoinError { .. } => None,
+            Error::UnknownPackageVersion { .. } => None,
         }
     }
 }
@@ -403,6 +440,8 @@ pub enum Warning {
         #[source]
         warning: tipo::error::Warning,
     },
+    #[error("{name} is already a dependency.")]
+    DependencyAlreadyExists { name: PackageName },
 }
 
 impl Diagnostic for Warning {
@@ -414,6 +453,7 @@ impl Diagnostic for Warning {
         match self {
             Warning::Type { named, .. } => Some(named),
             Warning::NoValidators => None,
+            Warning::DependencyAlreadyExists { .. } => None,
         }
     }
 
@@ -421,13 +461,30 @@ impl Diagnostic for Warning {
         match self {
             Warning::Type { warning, .. } => warning.labels(),
             Warning::NoValidators => None,
+            Warning::DependencyAlreadyExists { .. } => None,
         }
     }
 
     fn code<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
         match self {
-            Warning::Type { .. } => Some(Box::new("aiken::check")),
+            Warning::Type { warning, .. } => Some(Box::new(format!(
+                "aiken::check{}",
+                warning.code().map(|s| format!("::{s}")).unwrap_or_default()
+            ))),
             Warning::NoValidators => Some(Box::new("aiken::check")),
+            Warning::DependencyAlreadyExists { .. } => {
+                Some(Box::new("aiken::packages::already_exists"))
+            }
+        }
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
+        match self {
+            Warning::Type { warning, .. } => warning.help(),
+            Warning::NoValidators => None,
+            Warning::DependencyAlreadyExists { .. } => Some(Box::new(
+                "If you need to change the version, try 'aiken packages upgrade' instead.",
+            )),
         }
     }
 }

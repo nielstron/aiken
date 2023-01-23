@@ -30,25 +30,39 @@ pub fn module(
 
     let mut extra = ModuleExtra::new();
 
-    let tokens = tokens.into_iter().filter(|(token, span)| match token {
-        Token::ModuleComment => {
-            extra.module_comments.push(*span);
-            false
-        }
-        Token::DocComment => {
-            extra.doc_comments.push(*span);
-            false
-        }
-        Token::Comment => {
-            extra.comments.push(*span);
-            false
-        }
-        Token::EmptyLine => {
-            extra.empty_lines.push(span.start);
-            false
-        }
-        Token::NewLine => false,
-        _ => true,
+    let mut previous_is_newline = false;
+
+    let tokens = tokens.into_iter().filter_map(|(token, ref span)| {
+        let current_is_newline = token == Token::NewLine;
+        let result = match token {
+            Token::ModuleComment => {
+                extra.module_comments.push(*span);
+                None
+            }
+            Token::DocComment => {
+                extra.doc_comments.push(*span);
+                None
+            }
+            Token::Comment => {
+                extra.comments.push(*span);
+                None
+            }
+            Token::EmptyLine => {
+                extra.empty_lines.push(span.start);
+                None
+            }
+            Token::NewLine => None,
+            Token::LeftParen => {
+                if previous_is_newline {
+                    Some((Token::NewLineLeftParen, *span))
+                } else {
+                    Some((Token::LeftParen, *span))
+                }
+            }
+            _ => Some((token, *span)),
+        };
+        previous_is_newline = current_is_newline;
+        result
     });
 
     let definitions = module_parser().parse(chumsky::Stream::from_iter(span(len), tokens))?;
@@ -286,7 +300,7 @@ pub fn test_parser() -> impl Parser<Token, ast::UntypedDefinition, Error = Parse
                 location: span_end,
                 end_position: span.end - 1,
                 name,
-                public: true,
+                public: false,
                 return_annotation: None,
                 return_type: (),
             })
@@ -332,12 +346,14 @@ fn constant_value_parser() -> impl Parser<Token, ast::UntypedConstant, Error = P
                 }
             });
 
-        let constant_tuple_parser = just(Token::Hash)
-            .ignore_then(
-                r.clone()
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .delimited_by(just(Token::LeftParen), just(Token::RightParen)),
+        let constant_tuple_parser = r
+            .clone()
+            .separated_by(just(Token::Comma))
+            .at_least(2)
+            .allow_trailing()
+            .delimited_by(
+                choice((just(Token::LeftParen), just(Token::NewLineLeftParen))),
+                just(Token::RightParen),
             )
             .map_with_span(|elements, span| ast::UntypedConstant::Tuple {
                 location: span,
@@ -375,7 +391,7 @@ fn constant_value_parser() -> impl Parser<Token, ast::UntypedConstant, Error = P
         let constant_bytearray_hexstring_parser =
             just(Token::Hash)
                 .ignore_then(select! {Token::String {value} => value}.validate(
-                    |value, span, emit| match hex::decode(&value) {
+                    |value, span, emit| match hex::decode(value) {
                         Ok(bytes) => bytes,
                         Err(_) => {
                             emit(ParseError::malformed_base16_string_literal(span));
@@ -883,12 +899,14 @@ pub fn expr_parser(
                 label,
             });
 
-        let tuple = just(Token::Hash)
-            .ignore_then(
-                r.clone()
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .delimited_by(just(Token::LeftParen), just(Token::RightParen)),
+        let tuple = r
+            .clone()
+            .separated_by(just(Token::Comma))
+            .at_least(2)
+            .allow_trailing()
+            .delimited_by(
+                choice((just(Token::LeftParen), just(Token::NewLineLeftParen))),
+                just(Token::RightParen),
             )
             .map_with_span(|elems, span| expr::UntypedExpr::Tuple {
                 location: span,
@@ -942,9 +960,15 @@ pub fn expr_parser(
                 tail,
             });
 
-        let block_parser = seq_r
-            .clone()
-            .delimited_by(just(Token::LeftBrace), just(Token::RightBrace));
+        let block_parser = choice((
+            seq_r
+                .clone()
+                .delimited_by(just(Token::LeftBrace), just(Token::RightBrace)),
+            seq_r.clone().delimited_by(
+                choice((just(Token::LeftParen), just(Token::NewLineLeftParen))),
+                just(Token::RightParen),
+            ),
+        ));
 
         let anon_fn_parser = just(Token::Fn)
             .ignore_then(
@@ -1210,7 +1234,7 @@ pub fn expr_parser(
                         .collect();
 
                     let call = expr::UntypedExpr::Call {
-                        location: span,
+                        location: expr.location().union(span),
                         fun: Box::new(expr),
                         arguments: args,
                     };
@@ -1360,12 +1384,13 @@ pub fn type_parser() -> impl Parser<Token, ast::Annotation, Error = ParseError> 
                 }
             }),
             // Tuple
-            just(Token::Hash)
-                .ignore_then(
-                    r.clone()
-                        .separated_by(just(Token::Comma))
-                        .allow_trailing()
-                        .delimited_by(just(Token::LeftParen), just(Token::RightParen)),
+            r.clone()
+                .separated_by(just(Token::Comma))
+                .at_least(2)
+                .allow_trailing()
+                .delimited_by(
+                    choice((just(Token::LeftParen), just(Token::NewLineLeftParen))),
+                    just(Token::RightParen),
                 )
                 .map_with_span(|elems, span| ast::Annotation::Tuple {
                     location: span,
@@ -1587,12 +1612,12 @@ pub fn pattern_parser() -> impl Parser<Token, ast::UntypedPattern, Error = Parse
                     value,
                 }
             }),
-            just(Token::Hash)
-                .ignore_then(
-                    r.clone()
-                        .separated_by(just(Token::Comma))
-                        .allow_trailing()
-                        .delimited_by(just(Token::LeftParen), just(Token::RightParen)),
+            r.clone()
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .delimited_by(
+                    choice((just(Token::LeftParen), just(Token::NewLineLeftParen))),
+                    just(Token::RightParen),
                 )
                 .map_with_span(|elems, span| ast::UntypedPattern::Tuple {
                     location: span,

@@ -5,24 +5,25 @@ pub mod error;
 pub mod format;
 pub mod module;
 pub mod options;
+pub mod package_name;
 pub mod paths;
 pub mod pretty;
 pub mod script;
 pub mod telemetry;
 
-use crate::module::{CERT, MINT, SPEND, VALIDATOR_NAMES, WITHDRAW};
 use aiken_lang::{
     ast::{Definition, Function, ModuleKind, TypedDataType, TypedDefinition, TypedFunction},
     builder::{DataTypeKey, FunctionAccessKey},
     builtins::{self, generic_var},
     tipo::TypeInfo,
     uplc::CodeGenerator,
-    IdGenerator,
+    IdGenerator, MINT, PUBLISH, SPEND, VALIDATOR_NAMES, WITHDRAW,
 };
-use config::PackageName;
 use deps::UseManifest;
+use indexmap::IndexMap;
 use miette::NamedSource;
 use options::{CodeGenMode, Options};
+use package_name::PackageName;
 use pallas::{
     codec::minicbor,
     ledger::{addresses::Address, primitives::babbage},
@@ -83,7 +84,7 @@ where
         module_types.insert("aiken".to_string(), builtins::prelude(&id_gen));
         module_types.insert("aiken/builtin".to_string(), builtins::plutus(&id_gen));
 
-        let config = Config::load(root.clone())?;
+        let config = Config::load(&root)?;
 
         Ok(Project {
             config,
@@ -150,8 +151,9 @@ where
     pub fn check(
         &mut self,
         skip_tests: bool,
-        match_tests: Option<String>,
+        match_tests: Option<Vec<String>>,
         verbose: bool,
+        exact_match: bool,
     ) -> Result<(), Error> {
         let options = Options {
             code_gen_mode: if skip_tests {
@@ -160,6 +162,7 @@ where
                 CodeGenMode::Test {
                     match_tests,
                     verbose,
+                    exact_match,
                 }
             },
         };
@@ -200,6 +203,7 @@ where
             CodeGenMode::Test {
                 match_tests,
                 verbose,
+                exact_match,
             } => {
                 let tests =
                     self.collect_scripts(verbose, |def| matches!(def, Definition::Test(..)))?;
@@ -208,7 +212,7 @@ where
                     self.event_listener.handle_event(Event::RunningTests);
                 }
 
-                let results = self.eval_scripts(tests, match_tests);
+                let results = self.eval_scripts(tests, match_tests, exact_match);
 
                 let errors: Vec<Error> = results
                     .iter()
@@ -243,7 +247,6 @@ where
     fn compile_deps(&mut self) -> Result<(), Error> {
         let manifest = deps::download(
             &self.event_listener,
-            None,
             UseManifest::Yes,
             &self.root,
             &self.config,
@@ -428,7 +431,7 @@ where
 
                         // depending on name, validate the minimum number of arguments
                         // if too low, push a new error on to errors
-                        if [MINT, CERT, WITHDRAW].contains(&func_def.name.as_str())
+                        if [MINT, WITHDRAW, PUBLISH].contains(&func_def.name.as_str())
                             && func_def.arguments.len() < 2
                         {
                             errors.push(Error::WrongValidatorArity {
@@ -480,11 +483,11 @@ where
         validators: Vec<(PathBuf, String, TypedFunction)>,
     ) -> Result<Vec<Script>, Error> {
         let mut programs = Vec::new();
-        let mut functions = HashMap::new();
-        let mut type_aliases = HashMap::new();
-        let mut data_types = HashMap::new();
+        let mut functions = IndexMap::new();
+        let mut type_aliases = IndexMap::new();
+        let mut data_types = IndexMap::new();
 
-        let prelude_functions = builtins::prelude_functions();
+        let prelude_functions = builtins::prelude_functions(&self.id_gen);
         for (access_key, func) in prelude_functions.iter() {
             functions.insert(access_key.clone(), func);
         }
@@ -537,11 +540,15 @@ where
                 ..
             } = func_def;
 
+            let mut modules_map = IndexMap::new();
+
+            modules_map.extend(self.module_types.clone());
+
             let mut generator = CodeGenerator::new(
                 &functions,
                 // &type_aliases,
                 &data_types,
-                &self.module_types,
+                &modules_map,
             );
 
             self.event_listener.handle_event(Event::GeneratingUPLC {
@@ -571,11 +578,11 @@ where
         should_collect: fn(&TypedDefinition) -> bool,
     ) -> Result<Vec<Script>, Error> {
         let mut programs = Vec::new();
-        let mut functions = HashMap::new();
-        let mut type_aliases = HashMap::new();
-        let mut data_types = HashMap::new();
+        let mut functions = IndexMap::new();
+        let mut type_aliases = IndexMap::new();
+        let mut data_types = IndexMap::new();
 
-        let prelude_functions = builtins::prelude_functions();
+        let prelude_functions = builtins::prelude_functions(&self.id_gen);
         for (access_key, func) in prelude_functions.iter() {
             functions.insert(access_key.clone(), func);
         }
@@ -646,21 +653,25 @@ where
                 })
             }
 
+            let mut modules_map = IndexMap::new();
+
+            modules_map.extend(self.module_types.clone());
+
             let mut generator = CodeGenerator::new(
                 &functions,
                 // &type_aliases,
                 &data_types,
-                &self.module_types,
+                &modules_map,
             );
 
             let evaluation_hint = if let Some((bin_op, left_src, right_src)) = func_def.test_hint()
             {
-                let left = CodeGenerator::new(&functions, &data_types, &self.module_types)
+                let left = CodeGenerator::new(&functions, &data_types, &modules_map)
                     .generate(*left_src, vec![], false)
                     .try_into()
                     .unwrap();
 
-                let right = CodeGenerator::new(&functions, &data_types, &self.module_types)
+                let right = CodeGenerator::new(&functions, &data_types, &modules_map)
                     .generate(*right_src, vec![], false)
                     .try_into()
                     .unwrap();
@@ -690,7 +701,14 @@ where
         Ok(programs)
     }
 
-    fn eval_scripts(&self, scripts: Vec<Script>, match_name: Option<String>) -> Vec<EvalInfo> {
+    fn eval_scripts(
+        &self,
+        scripts: Vec<Script>,
+        match_tests: Option<Vec<String>>,
+        exact_match: bool,
+    ) -> Vec<EvalInfo> {
+        use rayon::prelude::*;
+
         // TODO: in the future we probably just want to be able to
         // tell the machine to not explode on budget consumption.
         let initial_budget = ExBudget {
@@ -698,43 +716,73 @@ where
             cpu: i64::MAX,
         };
 
-        let mut results = Vec::new();
+        let scripts = if let Some(match_tests) = match_tests {
+            let match_tests: Vec<(&str, Option<Vec<String>>)> = match_tests
+                .iter()
+                .map(|match_test| {
+                    let mut match_split_dot = match_test.split('.');
 
-        for script in scripts {
-            let path = format!("{}{}", script.module, script.name);
-
-            if matches!(&match_name, Some(search_str) if !path.to_string().contains(search_str)) {
-                continue;
-            }
-
-            match script.program.eval(initial_budget) {
-                (Ok(result), remaining_budget, logs) => {
-                    let eval_info = EvalInfo {
-                        success: result != Term::Error
-                            && result != Term::Constant(Constant::Bool(false)),
-                        script,
-                        spent_budget: initial_budget - remaining_budget,
-                        output: Some(result),
-                        logs,
+                    let match_module = if match_test.contains('.') {
+                        match_split_dot.next().unwrap_or("")
+                    } else {
+                        ""
                     };
 
-                    results.push(eval_info);
-                }
-                (Err(..), remaining_budget, logs) => {
-                    let eval_info = EvalInfo {
-                        success: false,
-                        script,
-                        spent_budget: initial_budget - remaining_budget,
-                        output: None,
-                        logs,
-                    };
+                    let match_names = match_split_dot.next().map(|names| {
+                        let names = names.replace(&['{', '}'][..], "");
 
-                    results.push(eval_info);
-                }
-            }
-        }
+                        let names_split_comma = names.split(',');
 
-        results
+                        names_split_comma.map(str::to_string).collect()
+                    });
+
+                    (match_module, match_names)
+                })
+                .collect();
+
+            scripts
+                .into_iter()
+                .filter(|script| -> bool {
+                    match_tests.iter().any(|(module, names)| {
+                        let matched_module = module == &"" || script.module.contains(module);
+
+                        let matched_name = matches!(names, Some(names) if names
+                            .iter()
+                            .any(|name| if exact_match {
+                                name == &script.name
+                            } else {
+                                script.name.contains(name)
+                            }
+                        ));
+
+                        matched_module && matched_name
+                    })
+                })
+                .collect::<Vec<Script>>()
+        } else {
+            scripts
+        };
+
+        scripts
+            .into_par_iter()
+            .map(|script| match script.program.eval(initial_budget) {
+                (Ok(result), remaining_budget, logs) => EvalInfo {
+                    success: result != Term::Error
+                        && result != Term::Constant(Constant::Bool(false)),
+                    script,
+                    spent_budget: initial_budget - remaining_budget,
+                    output: Some(result),
+                    logs,
+                },
+                (Err(..), remaining_budget, logs) => EvalInfo {
+                    success: false,
+                    script,
+                    spent_budget: initial_budget - remaining_budget,
+                    output: None,
+                    logs,
+                },
+            })
+            .collect()
     }
 
     fn output_path(&self) -> PathBuf {

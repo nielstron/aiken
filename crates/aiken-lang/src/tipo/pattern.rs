@@ -531,7 +531,7 @@ impl<'a, 'b> PatternTyper<'a, 'b> {
 
                                     let value = self.unify(value, typ.clone(), None)?;
 
-                                    Ok(CallArg {
+                                    Ok::<_, Error>(CallArg {
                                         value,
                                         location,
                                         label,
@@ -555,7 +555,7 @@ impl<'a, 'b> PatternTyper<'a, 'b> {
                             Err(Error::IncorrectPatternArity {
                                 location,
                                 given: pattern_args,
-                                expected: 0,
+                                expected: args.len(),
                                 name: name.clone(),
                                 module: module.clone(),
                                 is_record,

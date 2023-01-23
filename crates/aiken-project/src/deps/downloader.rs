@@ -3,7 +3,11 @@ use std::{io::Cursor, path::Path};
 use futures::future;
 use reqwest::Client;
 
-use crate::{config::PackageName, error::Error, paths};
+use crate::{
+    error::Error,
+    package_name::PackageName,
+    paths::{self, CacheKey},
+};
 
 use super::manifest::Package;
 
@@ -41,15 +45,20 @@ impl<'a> Downloader<'a> {
         &self,
         package: &Package,
     ) -> Result<bool, Error> {
-        self.ensure_package_downloaded(package).await?;
-        self.extract_package_from_cache(&package.name, &package.version)
+        let cache_key = paths::CacheKey::new(&self.http, package).await?;
+        self.ensure_package_downloaded(package, &cache_key).await?;
+        self.extract_package_from_cache(&package.name, &cache_key)
             .await
     }
 
-    pub async fn ensure_package_downloaded(&self, package: &Package) -> Result<bool, Error> {
+    pub async fn ensure_package_downloaded(
+        &self,
+        package: &Package,
+        cache_key: &CacheKey,
+    ) -> Result<bool, Error> {
         let packages_cache_path = paths::packages_cache();
-        let zipball_path =
-            paths::package_cache_zipball(&package.name, &package.version.to_string());
+
+        let zipball_path = paths::package_cache_zipball(cache_key);
 
         if !packages_cache_path.exists() {
             tokio::fs::create_dir_all(packages_cache_path).await?;
@@ -69,13 +78,19 @@ impl<'a> Downloader<'a> {
             .get(url)
             .header("User-Agent", "aiken-lang")
             .send()
-            .await?
-            .bytes()
             .await?;
+
+        if response.status().as_u16() >= 400 {
+            return Err(Error::UnknownPackageVersion {
+                package: package.clone(),
+            });
+        }
+
+        let bytes = response.bytes().await?;
 
         // let PackageSource::Github { url } = &package.source;
 
-        tokio::fs::write(&zipball_path, response).await?;
+        tokio::fs::write(&zipball_path, bytes).await?;
 
         Ok(true)
     }
@@ -83,7 +98,7 @@ impl<'a> Downloader<'a> {
     pub async fn extract_package_from_cache(
         &self,
         name: &PackageName,
-        version: &str,
+        cache_key: &CacheKey,
     ) -> Result<bool, Error> {
         let destination = self.root_path.join(paths::build_deps_package(name));
 
@@ -94,9 +109,7 @@ impl<'a> Downloader<'a> {
 
         tokio::fs::create_dir_all(&destination).await?;
 
-        let zipball_path = self
-            .root_path
-            .join(paths::package_cache_zipball(name, version));
+        let zipball_path = self.root_path.join(paths::package_cache_zipball(cache_key));
 
         let zipball = tokio::fs::read(zipball_path).await?;
 

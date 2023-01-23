@@ -1,9 +1,10 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
+use indexmap::IndexSet;
 use uplc::builtins::DefaultFunction;
 
 use crate::{
-    ast::{AssignmentKind, BinOp, UnOp},
+    ast::{BinOp, UnOp},
     tipo::{Type, ValueConstructor},
 };
 
@@ -22,6 +23,11 @@ pub enum Air {
     ByteArray {
         scope: Vec<u64>,
         bytes: Vec<u8>,
+    },
+
+    Bool {
+        scope: Vec<u64>,
+        value: bool,
     },
 
     Var {
@@ -77,7 +83,11 @@ pub enum Air {
     Assignment {
         scope: Vec<u64>,
         name: String,
-        kind: AssignmentKind,
+    },
+
+    Assert {
+        scope: Vec<u64>,
+        constr_index: usize,
     },
 
     DefineFunc {
@@ -87,27 +97,6 @@ pub enum Air {
         params: Vec<String>,
         recursive: bool,
         variant_name: String,
-    },
-
-    DefineConst {
-        scope: Vec<u64>,
-        func_name: String,
-        module_name: String,
-        count: usize,
-    },
-
-    DefineConstrFields {
-        scope: Vec<u64>,
-        func_name: String,
-        module_name: String,
-        count: usize,
-    },
-
-    DefineConstrFieldAccess {
-        scope: Vec<u64>,
-        func_name: String,
-        module_name: String,
-        count: usize,
     },
 
     Lam {
@@ -136,11 +125,15 @@ pub enum Air {
         complex_clause: bool,
     },
 
+    WrapClause {
+        scope: Vec<u64>,
+    },
+
     TupleClause {
         scope: Vec<u64>,
         tipo: Arc<Type>,
-        indices: HashSet<(usize, String)>,
-        predefined_indices: HashSet<(usize, String)>,
+        indices: IndexSet<(usize, String)>,
+        predefined_indices: IndexSet<(usize, String)>,
         subject_name: String,
         count: usize,
         complex_clause: bool,
@@ -172,19 +165,16 @@ pub enum Air {
         scope: Vec<u64>,
     },
 
-    Constr {
+    Record {
         scope: Vec<u64>,
-        count: usize,
-    },
-
-    Fields {
-        scope: Vec<u64>,
+        constr_index: usize,
+        tipo: Arc<Type>,
         count: usize,
     },
 
     RecordAccess {
         scope: Vec<u64>,
-        index: u64,
+        record_index: u64,
         tipo: Arc<Type>,
     },
 
@@ -203,7 +193,7 @@ pub enum Air {
     TupleIndex {
         scope: Vec<u64>,
         tipo: Arc<Type>,
-        index: usize,
+        tuple_index: usize,
     },
 
     Todo {
@@ -224,14 +214,10 @@ pub enum Air {
         tipo: Arc<Type>,
     },
 
-    Record {
-        scope: Vec<u64>,
-    },
-
     RecordUpdate {
         scope: Vec<u64>,
-        tipo: Arc<Type>,
-        count: usize,
+        highest_index: usize,
+        indices: Vec<(usize, Arc<Type>)>,
     },
 
     UnOp {
@@ -252,6 +238,7 @@ impl Air {
             Air::Int { scope, .. }
             | Air::String { scope, .. }
             | Air::ByteArray { scope, .. }
+            | Air::Bool { scope, .. }
             | Air::Var { scope, .. }
             | Air::List { scope, .. }
             | Air::ListAccessor { scope, .. }
@@ -261,33 +248,59 @@ impl Air {
             | Air::Builtin { scope, .. }
             | Air::BinOp { scope, .. }
             | Air::Assignment { scope, .. }
+            | Air::Assert { scope, .. }
             | Air::DefineFunc { scope, .. }
-            | Air::DefineConst { scope, .. }
-            | Air::DefineConstrFields { scope, .. }
-            | Air::DefineConstrFieldAccess { scope, .. }
             | Air::Lam { scope, .. }
             | Air::When { scope, .. }
             | Air::Clause { scope, .. }
             | Air::ListClause { scope, .. }
+            | Air::TupleClause { scope, .. }
+            | Air::WrapClause { scope }
             | Air::ClauseGuard { scope, .. }
             | Air::ListClauseGuard { scope, .. }
             | Air::Discard { scope }
             | Air::Finally { scope }
             | Air::If { scope, .. }
-            | Air::Constr { scope, .. }
-            | Air::Fields { scope, .. }
+            | Air::Record { scope, .. }
             | Air::RecordAccess { scope, .. }
             | Air::FieldsExpose { scope, .. }
             | Air::Tuple { scope, .. }
             | Air::Todo { scope, .. }
             | Air::ErrorTerm { scope, .. }
-            | Air::Record { scope, .. }
             | Air::RecordUpdate { scope, .. }
             | Air::UnOp { scope, .. }
             | Air::Trace { scope, .. }
             | Air::TupleAccessor { scope, .. }
-            | Air::TupleIndex { scope, .. }
-            | Air::TupleClause { scope, .. } => scope.to_vec(),
+            | Air::TupleIndex { scope, .. } => scope.to_vec(),
+        }
+    }
+
+    pub fn tipo(&self) -> Option<Arc<Type>> {
+        match self {
+            Air::List { tipo, .. }
+            | Air::ListAccessor { tipo, .. }
+            | Air::ListExpose { tipo, .. }
+            | Air::Builtin { tipo, .. }
+            | Air::BinOp { tipo, .. }
+            | Air::When { tipo, .. }
+            | Air::Clause { tipo, .. }
+            | Air::ListClause { tipo, .. }
+            | Air::TupleClause { tipo, .. }
+            | Air::ClauseGuard { tipo, .. }
+            | Air::ListClauseGuard { tipo, .. }
+            | Air::Record { tipo, .. }
+            | Air::RecordAccess { tipo, .. }
+            | Air::Tuple { tipo, .. }
+            | Air::TupleIndex { tipo, .. }
+            | Air::Todo { tipo, .. }
+            | Air::ErrorTerm { tipo, .. }
+            | Air::Trace { tipo, .. }
+            | Air::TupleAccessor { tipo, .. }
+            | Air::Var {
+                constructor: ValueConstructor { tipo, .. },
+                ..
+            } => Some(tipo.clone()),
+            _ => None,
         }
     }
 }

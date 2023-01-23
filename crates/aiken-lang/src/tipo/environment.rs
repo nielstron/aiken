@@ -8,17 +8,17 @@ use itertools::Itertools;
 
 use crate::{
     ast::{
-        Annotation, CallArg, DataType, Definition, Function, ModuleConstant, Pattern,
+        Annotation, CallArg, DataType, Definition, Function, ModuleConstant, ModuleKind, Pattern,
         RecordConstructor, RecordConstructorArg, Span, TypeAlias, TypedDefinition,
         UnqualifiedImport, UntypedDefinition, Use, PIPE_VARIABLE,
     },
     builtins::{self, function, generic_var, tuple, unbound_var},
     tipo::fields::FieldMap,
-    IdGenerator,
+    IdGenerator, VALIDATOR_NAMES,
 };
 
 use super::{
-    error::{Error, Warning},
+    error::{Error, Snippet, Warning},
     hydrator::Hydrator,
     AccessorsMap, PatternConstructor, RecordAccessor, Type, TypeConstructor, TypeInfo, TypeVar,
     ValueConstructor, ValueConstructorVariant,
@@ -680,9 +680,16 @@ impl<'a> Environment<'a> {
                         .get(&name)
                         .ok_or_else(|| Error::UnknownModule {
                             location: *location,
-                            name,
+                            name: name.clone(),
                             imported_modules: self.imported_modules.keys().cloned().collect(),
                         })?;
+
+                if module_info.kind.is_validator() {
+                    return Err(Error::ValidatorImported {
+                        location: *location,
+                        name,
+                    });
+                }
 
                 // Determine local alias of imported module
                 let module_name = as_name
@@ -860,26 +867,41 @@ impl<'a> Environment<'a> {
             Some(e) => {
                 let known_types_after = names.keys().copied().collect::<Vec<_>>();
                 if known_types_before == known_types_after {
-                    let cycle = remaining_definitions
+                    let unknown_name = match e {
+                        Error::UnknownType { ref name, .. } => name,
+                        _ => "",
+                    };
+                    let mut is_cyclic = false;
+                    let unknown_types = remaining_definitions
                         .into_iter()
                         .filter_map(|def| match def {
                             Definition::TypeAlias(TypeAlias {
                                 alias, location, ..
-                            }) => Some((alias.to_owned(), location.to_owned())),
-                            _ => None,
+                            }) => {
+                                is_cyclic = is_cyclic || alias == unknown_name;
+                                Some(Snippet {
+                                    location: location.to_owned(),
+                                })
+                            }
+                            Definition::DataType(DataType { name, location, .. }) => {
+                                is_cyclic = is_cyclic || name == unknown_name;
+                                Some(Snippet {
+                                    location: location.to_owned(),
+                                })
+                            }
+                            Definition::Fn { .. }
+                            | Definition::Use { .. }
+                            | Definition::ModuleConstant { .. }
+                            | Definition::Test { .. } => None,
                         })
-                        .collect::<Vec<(String, Span)>>();
-                    match cycle.first() {
-                        None => Err(e),
-                        Some((alias, location)) => {
-                            let mut types =
-                                cycle.iter().map(|def| def.0.clone()).collect::<Vec<_>>();
-                            types.push(alias.clone());
-                            Err(Error::CyclicTypeDefinitions {
-                                location: *location,
-                                types,
-                            })
-                        }
+                        .collect::<Vec<Snippet>>();
+
+                    if is_cyclic {
+                        Err(Error::CyclicTypeDefinitions {
+                            errors: unknown_types,
+                        })
+                    } else {
+                        Err(e)
                     }
                 } else {
                     self.register_types(remaining_definitions, module, hydrators, names)
@@ -993,6 +1015,7 @@ impl<'a> Environment<'a> {
         module_name: &String,
         hydrators: &mut HashMap<String, Hydrator>,
         names: &mut HashMap<&'a str, &'a Span>,
+        kind: ModuleKind,
     ) -> Result<(), Error> {
         match def {
             Definition::Fn(Function {
@@ -1051,7 +1074,7 @@ impl<'a> Environment<'a> {
                     tipo,
                 );
 
-                if !public {
+                if !public && (kind.is_lib() || !VALIDATOR_NAMES.contains(&name.as_str())) {
                     self.init_usage(name.clone(), EntityKind::PrivateFunction, *location);
                 }
             }

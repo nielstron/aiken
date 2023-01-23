@@ -1,11 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-    sync::Arc,
-    vec,
-};
+use std::{sync::Arc, vec};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use uplc::{
     ast::{
@@ -27,10 +22,12 @@ use crate::{
         TypedFunction, UnOp,
     },
     builder::{
-        check_when_pattern_needs, constants_ir, convert_constants_to_data, convert_data_to_type,
-        convert_type_to_data, get_common_ancestor, get_generics_and_type, handle_func_deps_ir,
-        handle_recursion_ir, list_access_to_uplc, monomorphize, rearrange_clauses,
-        wrap_validator_args, ClauseProperties, DataTypeKey, FuncComponents, FunctionAccessKey,
+        check_replaceable_opaque_type, check_when_pattern_needs, constants_ir,
+        convert_constants_to_data, convert_data_to_type, convert_type_to_data, get_common_ancestor,
+        get_generics_and_type, handle_func_dependencies_ir, handle_recursion_ir,
+        list_access_to_uplc, lookup_data_type_by_tipo, monomorphize, rearrange_clauses,
+        replace_opaque_type, wrap_validator_args, ClauseProperties, DataTypeKey, FuncComponents,
+        FunctionAccessKey,
     },
     expr::TypedExpr,
     tipo::{
@@ -41,32 +38,32 @@ use crate::{
 };
 
 pub struct CodeGenerator<'a> {
-    defined_functions: HashMap<FunctionAccessKey, ()>,
-    functions: &'a HashMap<FunctionAccessKey, &'a TypedFunction>,
-    // type_aliases: &'a HashMap<(String, String), &'a TypeAlias<Arc<tipo::Type>>>,
-    data_types: &'a HashMap<DataTypeKey, &'a TypedDataType>,
-    module_types: &'a HashMap<String, TypeInfo>,
+    defined_functions: IndexMap<FunctionAccessKey, ()>,
+    functions: &'a IndexMap<FunctionAccessKey, &'a TypedFunction>,
+    // type_aliases: &'a IndexMap<(String, String), &'a TypeAlias<Arc<tipo::Type>>>,
+    data_types: &'a IndexMap<DataTypeKey, &'a TypedDataType>,
+    module_types: &'a IndexMap<String, TypeInfo>,
     id_gen: IdGenerator,
     needs_field_access: bool,
-    zero_arg_functions: HashMap<FunctionAccessKey, Vec<Air>>,
+    zero_arg_functions: IndexMap<FunctionAccessKey, Vec<Air>>,
 }
 
 impl<'a> CodeGenerator<'a> {
     pub fn new(
-        functions: &'a HashMap<FunctionAccessKey, &'a TypedFunction>,
-        // type_aliases: &'a HashMap<(String, String), &'a TypeAlias<Arc<tipo::Type>>>,
-        data_types: &'a HashMap<DataTypeKey, &'a TypedDataType>,
-        module_types: &'a HashMap<String, TypeInfo>,
+        functions: &'a IndexMap<FunctionAccessKey, &'a TypedFunction>,
+        // type_aliases: &'a IndexMap<(String, String), &'a TypeAlias<Arc<tipo::Type>>>,
+        data_types: &'a IndexMap<DataTypeKey, &'a TypedDataType>,
+        module_types: &'a IndexMap<String, TypeInfo>,
     ) -> Self {
         CodeGenerator {
-            defined_functions: HashMap::new(),
+            defined_functions: IndexMap::new(),
             functions,
             // type_aliases,
             data_types,
             module_types,
             id_gen: IdGenerator::new(),
             needs_field_access: false,
-            zero_arg_functions: HashMap::new(),
+            zero_arg_functions: IndexMap::new(),
         }
     }
 
@@ -82,6 +79,8 @@ impl<'a> CodeGenerator<'a> {
         self.build_ir(&body, &mut ir_stack, scope);
 
         self.define_ir(&mut ir_stack);
+
+        self.convert_opaque_type_to_inner_ir(&mut ir_stack);
 
         let mut term = self.uplc_code_gen(&mut ir_stack);
 
@@ -207,7 +206,39 @@ impl<'a> CodeGenerator<'a> {
                     self.build_ir(tail, ir_stack, scope);
                 }
             }
-            TypedExpr::Call { fun, args, .. } => {
+            TypedExpr::Call {
+                fun, args, tipo, ..
+            } => {
+                if let Some(data_type) = lookup_data_type_by_tipo(self.data_types.clone(), tipo) {
+                    if let TypedExpr::Var { constructor, .. } = &**fun {
+                        if let ValueConstructorVariant::Record {
+                            name: constr_name, ..
+                        } = &constructor.variant
+                        {
+                            let (constr_index, _) = data_type
+                                .constructors
+                                .iter()
+                                .enumerate()
+                                .find(|(_, dt)| &dt.name == constr_name)
+                                .unwrap();
+
+                            ir_stack.push(Air::Record {
+                                scope: scope.clone(),
+                                constr_index,
+                                tipo: constructor.tipo.clone(),
+                                count: args.len(),
+                            });
+
+                            for arg in args {
+                                let mut scope = scope.clone();
+                                scope.push(self.id_gen.next());
+                                self.build_ir(&arg.value, ir_stack, scope);
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 ir_stack.push(Air::Call {
                     scope: scope.clone(),
                     count: args.len(),
@@ -247,7 +278,6 @@ impl<'a> CodeGenerator<'a> {
                 tipo,
                 ..
             } => {
-                let mut define_vec: Vec<Air> = vec![];
                 let mut value_vec: Vec<Air> = vec![];
                 let mut pattern_vec: Vec<Air> = vec![];
 
@@ -265,7 +295,6 @@ impl<'a> CodeGenerator<'a> {
                     scope,
                 );
 
-                ir_stack.append(&mut define_vec);
                 ir_stack.append(&mut pattern_vec);
             }
             TypedExpr::When {
@@ -412,7 +441,7 @@ impl<'a> CodeGenerator<'a> {
 
                 ir_stack.push(Air::RecordAccess {
                     scope: scope.clone(),
-                    index: *index,
+                    record_index: *index,
                     tipo: tipo.clone(),
                 });
 
@@ -477,11 +506,11 @@ impl<'a> CodeGenerator<'a> {
                     tipo: tipo.clone(),
                 });
             }
-            TypedExpr::RecordUpdate {
-                tipo, spread, args, ..
-            } => {
+            TypedExpr::RecordUpdate { spread, args, .. } => {
                 let mut update_ir = vec![];
                 let mut spread_scope = scope.clone();
+                let mut index_types = vec![];
+                let mut highest_index = 0;
                 spread_scope.push(self.id_gen.next());
 
                 self.build_ir(spread, &mut update_ir, spread_scope);
@@ -490,14 +519,21 @@ impl<'a> CodeGenerator<'a> {
                     let mut arg_scope = scope.clone();
                     arg_scope.push(self.id_gen.next());
 
-                    self.build_ir(&arg.value, &mut update_ir, arg_scope)
+                    self.build_ir(&arg.value, &mut update_ir, arg_scope);
+
+                    if arg.index > highest_index {
+                        highest_index = arg.index;
+                    }
+                    index_types.push((arg.index, arg.value.tipo()));
                 }
 
                 ir_stack.push(Air::RecordUpdate {
                     scope,
-                    tipo: tipo.clone(),
-                    count: args.len(),
+                    highest_index,
+                    indices: index_types,
                 });
+
+                ir_stack.append(&mut update_ir);
             }
             TypedExpr::UnOp { value, op, .. } => {
                 ir_stack.push(Air::UnOp {
@@ -544,7 +580,7 @@ impl<'a> CodeGenerator<'a> {
                 ir_stack.push(Air::TupleIndex {
                     scope: scope.clone(),
                     tipo: tuple.tipo(),
-                    index: *index,
+                    tuple_index: *index,
                 });
 
                 self.build_ir(tuple, ir_stack, scope);
@@ -609,7 +645,14 @@ impl<'a> CodeGenerator<'a> {
                     current_index,
                     ..
                 } => {
-                    let current_clause_index = *current_index;
+                    let current_clause_index =
+                        if let Pattern::List { elements, .. } = &clause.pattern[0] {
+                            elements.len()
+                        } else {
+                            unreachable!()
+                        };
+
+                    let prev_index = *current_index;
 
                     let subject_name = if current_clause_index == 0 {
                         original_subject_name.clone()
@@ -629,20 +672,36 @@ impl<'a> CodeGenerator<'a> {
                     let next_tail = if index == clauses.len() - 1 {
                         None
                     } else {
-                        Some(format!("__tail_{}", current_clause_index))
+                        let next_list_size = if let Pattern::List { elements, .. } =
+                            &clauses[index + 1].pattern[0]
+                        {
+                            elements.len()
+                        } else {
+                            unreachable!()
+                        };
+
+                        if next_list_size == current_clause_index {
+                            None
+                        } else {
+                            Some(format!("__tail_{}", current_clause_index))
+                        }
                     };
 
-                    ir_stack.push(Air::ListClause {
-                        scope,
-                        tipo: subject_type.clone(),
-                        tail_name: subject_name,
-                        next_tail_name: next_tail,
-                        complex_clause: *clause_properties.is_complex_clause(),
-                    });
+                    if current_clause_index as i64 == prev_index {
+                        ir_stack.push(Air::WrapClause { scope });
+                    } else {
+                        ir_stack.push(Air::ListClause {
+                            scope,
+                            tipo: subject_type.clone(),
+                            tail_name: subject_name,
+                            next_tail_name: next_tail,
+                            complex_clause: *clause_properties.is_complex_clause(),
+                        });
+                    }
 
                     match clause_properties {
                         ClauseProperties::ListClause { current_index, .. } => {
-                            *current_index += 1;
+                            *current_index = current_clause_index as i64;
                         }
                         _ => unreachable!(),
                     }
@@ -799,76 +858,68 @@ impl<'a> CodeGenerator<'a> {
                 let mut temp_clause_properties = clause_properties.clone();
                 *temp_clause_properties.needs_constr_var() = false;
 
-                for arg in arguments {
-                    check_when_pattern_needs(&arg.value, &mut temp_clause_properties);
-                }
-
-                // find data type definition
-                let data_type_key = match tipo {
-                    Type::Fn { ret, .. } => match ret.as_ref() {
-                        Type::App { module, name, .. } => DataTypeKey {
-                            module_name: module.clone(),
-                            defined_type: name.clone(),
-                        },
-                        _ => unreachable!(),
-                    },
-                    Type::App { module, name, .. } => DataTypeKey {
-                        module_name: module.clone(),
-                        defined_type: name.clone(),
-                    },
-                    _ => unreachable!(),
-                };
-
-                let data_type = self.data_types.get(&data_type_key).unwrap();
-
-                let (index, _) = data_type
-                    .constructors
-                    .iter()
-                    .enumerate()
-                    .find(|(_, dt)| &dt.name == constr_name)
-                    .unwrap();
-
-                let mut new_vec = vec![Air::Var {
-                    constructor: ValueConstructor::public(
-                        tipo.clone().into(),
-                        ValueConstructorVariant::LocalVariable {
-                            location: Span::empty(),
-                        },
-                    ),
-                    name: temp_clause_properties.clause_var_name().clone(),
-                    scope: scope.clone(),
-                    variant_name: String::new(),
-                }];
-
-                // if only one constructor, no need to check
-                if data_type.constructors.len() > 1 {
-                    // push constructor Index
-                    pattern_vec.push(Air::Int {
-                        value: index.to_string(),
-                        scope: scope.clone(),
+                if tipo.is_bool() {
+                    pattern_vec.push(Air::Bool {
+                        scope,
+                        value: constr_name == "True",
                     });
-                }
-
-                if *temp_clause_properties.needs_constr_var() {
-                    self.when_recursive_ir(
-                        pattern,
-                        pattern_vec,
-                        &mut new_vec,
-                        clause_properties,
-                        tipo,
-                        scope,
-                    );
                 } else {
-                    self.when_recursive_ir(
-                        pattern,
-                        pattern_vec,
-                        &mut vec![],
-                        clause_properties,
-                        tipo,
-                        scope,
-                    );
-                }
+                    for arg in arguments {
+                        check_when_pattern_needs(&arg.value, &mut temp_clause_properties);
+                    }
 
+                    // find data type definition
+                    let data_type =
+                        lookup_data_type_by_tipo(self.data_types.clone(), tipo).unwrap();
+
+                    let (index, _) = data_type
+                        .constructors
+                        .iter()
+                        .enumerate()
+                        .find(|(_, dt)| &dt.name == constr_name)
+                        .unwrap();
+
+                    let mut new_vec = vec![Air::Var {
+                        constructor: ValueConstructor::public(
+                            tipo.clone().into(),
+                            ValueConstructorVariant::LocalVariable {
+                                location: Span::empty(),
+                            },
+                        ),
+                        name: temp_clause_properties.clause_var_name().clone(),
+                        scope: scope.clone(),
+                        variant_name: String::new(),
+                    }];
+
+                    // if only one constructor, no need to check
+                    if data_type.constructors.len() > 1 {
+                        // push constructor Index
+                        pattern_vec.push(Air::Int {
+                            value: index.to_string(),
+                            scope: scope.clone(),
+                        });
+                    }
+
+                    if *temp_clause_properties.needs_constr_var() {
+                        self.when_recursive_ir(
+                            pattern,
+                            pattern_vec,
+                            &mut new_vec,
+                            clause_properties,
+                            tipo,
+                            scope,
+                        );
+                    } else {
+                        self.when_recursive_ir(
+                            pattern,
+                            pattern_vec,
+                            &mut vec![],
+                            clause_properties,
+                            tipo,
+                            scope,
+                        );
+                    }
+                }
                 pattern_vec.append(values);
 
                 // unify clause properties
@@ -995,22 +1046,8 @@ impl<'a> CodeGenerator<'a> {
                 tipo,
                 ..
             } => {
-                let data_type_key = match tipo.as_ref() {
-                    Type::Fn { ret, .. } => match &**ret {
-                        Type::App { module, name, .. } => DataTypeKey {
-                            module_name: module.clone(),
-                            defined_type: name.clone(),
-                        },
-                        _ => unreachable!(),
-                    },
-                    Type::App { module, name, .. } => DataTypeKey {
-                        module_name: module.clone(),
-                        defined_type: name.clone(),
-                    },
-                    _ => unreachable!(),
-                };
+                let data_type = lookup_data_type_by_tipo(self.data_types.clone(), tipo).unwrap();
 
-                let data_type = self.data_types.get(&data_type_key).unwrap();
                 let (_, constructor_type) = data_type
                     .constructors
                     .iter()
@@ -1020,12 +1057,10 @@ impl<'a> CodeGenerator<'a> {
                 let mut nested_pattern = vec![];
                 if *is_record {
                     let field_map = match constructor {
-                        tipo::PatternConstructor::Record { field_map, .. } => {
-                            field_map.clone().unwrap()
-                        }
+                        PatternConstructor::Record { field_map, .. } => field_map.clone().unwrap(),
                     };
 
-                    let mut type_map: HashMap<String, Arc<Type>> = HashMap::new();
+                    let mut type_map: IndexMap<String, Arc<Type>> = IndexMap::new();
 
                     for (index, arg) in tipo.arg_types().unwrap().iter().enumerate() {
                         let label = constructor_type.arguments[index].label.clone().unwrap();
@@ -1077,7 +1112,7 @@ impl<'a> CodeGenerator<'a> {
                         });
                     }
                 } else {
-                    let mut type_map: HashMap<usize, Arc<Type>> = HashMap::new();
+                    let mut type_map: IndexMap<usize, Arc<Type>> = IndexMap::new();
 
                     for (index, arg) in tipo.arg_types().unwrap().iter().enumerate() {
                         let field_type = arg.clone();
@@ -1146,7 +1181,7 @@ impl<'a> CodeGenerator<'a> {
                 for (name, index) in names.clone() {
                     if let Some(defined_index) = defined_indices
                         .iter()
-                        .find(|(defined_index, _)| *defined_index as usize == index)
+                        .find(|(defined_index, _)| *defined_index == index)
                     {
                         previous_defined_names.push(defined_index.clone());
                     } else {
@@ -1233,24 +1268,18 @@ impl<'a> CodeGenerator<'a> {
                             needs_constr_var: false,
                             is_complex_clause: false,
                             original_subject_name: item_name.clone(),
-                            current_index: index,
+                            current_index: index as i64,
                         };
 
                         let tail_name = format!("{}_{}", new_tail_name, index);
 
                         if elements.len() - 1 == index {
                             if tail.is_some() {
-                                let tail_name = match *tail.clone().unwrap() {
-                                    Pattern::Var { name, .. } => name,
-                                    Pattern::Discard { .. } => "_".to_string(),
-                                    _ => unreachable!(),
-                                };
-
                                 pattern_vec.push(Air::ListClauseGuard {
                                     scope: scope.clone(),
                                     tipo: pattern_type.clone(),
                                     tail_name: prev_tail_name,
-                                    next_tail_name: Some(tail_name),
+                                    next_tail_name: None,
                                     inverse: true,
                                 });
 
@@ -1319,7 +1348,6 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
 
-                // self.when_recursive_ir(a);
                 Some(item_name)
             }
             a @ Pattern::Constructor {
@@ -1329,22 +1357,7 @@ impl<'a> CodeGenerator<'a> {
             } => {
                 let id = self.id_gen.next();
                 let constr_var_name = format!("{constr_name}_{id}");
-                let data_type_key = match tipo.as_ref() {
-                    Type::Fn { ret, .. } => match &**ret {
-                        Type::App { module, name, .. } => DataTypeKey {
-                            module_name: module.clone(),
-                            defined_type: name.clone(),
-                        },
-                        _ => unreachable!(),
-                    },
-                    Type::App { module, name, .. } => DataTypeKey {
-                        module_name: module.clone(),
-                        defined_type: name.clone(),
-                    },
-                    _ => unreachable!(),
-                };
-
-                let data_type = self.data_types.get(&data_type_key).unwrap();
+                let data_type = lookup_data_type_by_tipo(self.data_types.clone(), tipo).unwrap();
 
                 if data_type.constructors.len() > 1 {
                     pattern_vec.push(Air::ClauseGuard {
@@ -1380,7 +1393,7 @@ impl<'a> CodeGenerator<'a> {
                     needs_constr_var: false,
                     is_complex_clause: false,
                     original_subject_name: item_name.clone(),
-                    defined_tuple_indices: HashSet::new(),
+                    defined_tuple_indices: IndexSet::new(),
                 };
 
                 let mut inner_pattern_vec = vec![];
@@ -1406,7 +1419,7 @@ impl<'a> CodeGenerator<'a> {
                     scope,
                     tipo: pattern_type.clone(),
                     indices: defined_indices,
-                    predefined_indices: HashSet::new(),
+                    predefined_indices: IndexSet::new(),
                     subject_name: clause_properties.original_subject_name().to_string(),
                     count: elems.len(),
                     complex_clause: false,
@@ -1434,7 +1447,6 @@ impl<'a> CodeGenerator<'a> {
             Pattern::Var { name, .. } => {
                 pattern_vec.push(Air::Assignment {
                     name: name.clone(),
-                    kind,
                     scope,
                 });
 
@@ -1443,13 +1455,80 @@ impl<'a> CodeGenerator<'a> {
             Pattern::VarUsage { .. } => todo!(),
             Pattern::Assign { .. } => todo!(),
             Pattern::Discard { .. } => {
-                self.pattern_ir(pattern, pattern_vec, value_vec, tipo, scope)
+                pattern_vec.push(Air::Assignment {
+                    name: "_".to_string(),
+                    scope,
+                });
+
+                pattern_vec.append(value_vec);
             }
             list @ Pattern::List { .. } => {
                 self.pattern_ir(list, pattern_vec, value_vec, tipo, scope);
             }
-            Pattern::Constructor { .. } => {
-                self.pattern_ir(pattern, pattern_vec, value_vec, tipo, scope);
+            Pattern::Constructor {
+                name: constr_name,
+                tipo,
+                ..
+            } => {
+                let data_type = lookup_data_type_by_tipo(self.data_types.clone(), tipo);
+
+                let (index, _) = data_type
+                    .unwrap()
+                    .constructors
+                    .iter()
+                    .enumerate()
+                    .find(|(_, dt)| &dt.name == constr_name)
+                    .unwrap();
+                match kind {
+                    AssignmentKind::Let => {
+                        self.pattern_ir(pattern, pattern_vec, value_vec, tipo, scope);
+                    }
+                    AssignmentKind::Assert => {
+                        let name_id = self.id_gen.next();
+                        pattern_vec.push(Air::Lam {
+                            scope: scope.clone(),
+                            name: format!("__constr_{}", name_id),
+                        });
+
+                        pattern_vec.append(value_vec);
+
+                        pattern_vec.push(Air::Assert {
+                            scope: scope.clone(),
+                            constr_index: index,
+                        });
+
+                        pattern_vec.push(Air::Var {
+                            scope: scope.clone(),
+                            constructor: ValueConstructor::public(
+                                tipo.clone(),
+                                ValueConstructorVariant::LocalVariable {
+                                    location: Span::empty(),
+                                },
+                            ),
+                            name: format!("__constr_{}", name_id),
+                            variant_name: String::new(),
+                        });
+
+                        self.pattern_ir(
+                            pattern,
+                            pattern_vec,
+                            &mut vec![Air::Var {
+                                scope: scope.clone(),
+                                constructor: ValueConstructor::public(
+                                    tipo.clone(),
+                                    ValueConstructorVariant::LocalVariable {
+                                        location: Span::empty(),
+                                    },
+                                ),
+                                name: format!("__constr_{}", name_id),
+                                variant_name: String::new(),
+                            }],
+                            tipo,
+                            scope,
+                        );
+                    }
+                    AssignmentKind::Check => todo!(),
+                }
             }
             Pattern::Tuple { .. } => {
                 self.pattern_ir(pattern, pattern_vec, value_vec, tipo, scope);
@@ -1544,22 +1623,7 @@ impl<'a> CodeGenerator<'a> {
                 tipo,
                 ..
             } => {
-                let data_type_key = match tipo.as_ref() {
-                    Type::Fn { ret, .. } => match &**ret {
-                        Type::App { module, name, .. } => DataTypeKey {
-                            module_name: module.clone(),
-                            defined_type: name.clone(),
-                        },
-                        _ => unreachable!(),
-                    },
-                    Type::App { module, name, .. } => DataTypeKey {
-                        module_name: module.clone(),
-                        defined_type: name.clone(),
-                    },
-                    _ => unreachable!(),
-                };
-
-                let data_type = self.data_types.get(&data_type_key).unwrap();
+                let data_type = lookup_data_type_by_tipo(self.data_types.clone(), tipo).unwrap();
                 let (_, constructor_type) = data_type
                     .constructors
                     .iter()
@@ -1574,7 +1638,7 @@ impl<'a> CodeGenerator<'a> {
                         }
                     };
 
-                    let mut type_map: HashMap<String, Arc<Type>> = HashMap::new();
+                    let mut type_map: IndexMap<String, Arc<Type>> = IndexMap::new();
 
                     for (index, arg) in tipo.arg_types().unwrap().iter().enumerate() {
                         let label = constructor_type.arguments[index].label.clone().unwrap();
@@ -1643,7 +1707,7 @@ impl<'a> CodeGenerator<'a> {
                         });
                     }
                 } else {
-                    let mut type_map: HashMap<usize, Arc<Type>> = HashMap::new();
+                    let mut type_map: IndexMap<usize, Arc<Type>> = IndexMap::new();
 
                     for (index, arg) in tipo.arg_types().unwrap().iter().enumerate() {
                         let field_type = arg.clone();
@@ -1722,6 +1786,9 @@ impl<'a> CodeGenerator<'a> {
                         Pattern::Var { name, .. } => {
                             names.push(name.clone());
                         }
+                        Pattern::Discard { .. } => {
+                            names.push("_".to_string());
+                        }
                         a @ Pattern::List { .. } => {
                             let mut var_vec = vec![];
                             let item_name = format!("list_item_id_{}", self.id_gen.next());
@@ -1780,8 +1847,8 @@ impl<'a> CodeGenerator<'a> {
         );
 
         let mut final_func_dep_ir = IndexMap::new();
-        let mut zero_arg_defined_functions = HashMap::new();
-        let mut to_be_defined = HashMap::new();
+        let mut zero_arg_defined_functions = IndexMap::new();
+        let mut to_be_defined = IndexMap::new();
 
         let mut dependency_map = IndexMap::new();
         let mut dependency_vec = vec![];
@@ -1811,7 +1878,7 @@ impl<'a> CodeGenerator<'a> {
 
             if !funt_comp.args.is_empty() {
                 // deal with function dependencies
-                handle_func_deps_ir(
+                handle_func_dependencies_ir(
                     &mut dep_ir,
                     funt_comp,
                     &func_components,
@@ -1823,22 +1890,27 @@ impl<'a> CodeGenerator<'a> {
                 final_func_dep_ir.insert(func, dep_ir);
             } else {
                 // since zero arg functions are run at compile time we need to pull all deps
-                let mut defined_functions = HashMap::new();
+                // note anon functions are not included in the above. They exist in a function anyway
+                let mut defined_functions = IndexMap::new();
                 // deal with function dependencies in zero arg functions
-                handle_func_deps_ir(
+                handle_func_dependencies_ir(
                     &mut dep_ir,
                     funt_comp,
                     &func_components,
                     &mut defined_functions,
                     &func_index_map,
                     func_scope,
-                    &mut HashMap::new(),
+                    &mut IndexMap::new(),
                 );
 
                 let mut final_zero_arg_ir = dep_ir;
                 final_zero_arg_ir.extend(funt_comp.ir.clone());
-                self.zero_arg_functions.insert(func, final_zero_arg_ir);
 
+                self.convert_opaque_type_to_inner_ir(&mut final_zero_arg_ir);
+
+                self.zero_arg_functions.insert(func, final_zero_arg_ir);
+                // zero arg functions don't contain the dependencies since they are pre-evaluated
+                // As such we add functions to defined only after dependencies for all other functions are calculated
                 for (key, val) in defined_functions.into_iter() {
                     zero_arg_defined_functions.insert(key, val);
                 }
@@ -2038,7 +2110,7 @@ impl<'a> CodeGenerator<'a> {
 
                             let param_types = constructor.tipo.arg_types().unwrap();
 
-                            let mut generics_type_map: HashMap<u64, Arc<Type>> = HashMap::new();
+                            let mut generics_type_map: IndexMap<u64, Arc<Type>> = IndexMap::new();
 
                             for (index, arg) in function.arguments.iter().enumerate() {
                                 if arg.tipo.is_generic() {
@@ -2076,7 +2148,7 @@ impl<'a> CodeGenerator<'a> {
                                 to_be_defined_map.insert(function_key.clone(), scope.to_vec());
                             } else {
                                 to_be_defined_map.insert(function_key.clone(), scope.to_vec());
-                                let mut func_calls = HashMap::new();
+                                let mut func_calls = IndexMap::new();
 
                                 for ir in func_ir.clone().into_iter() {
                                     if let Air::Var {
@@ -2112,8 +2184,8 @@ impl<'a> CodeGenerator<'a> {
                                         } else if let (Some(function), Type::Fn { .. }) =
                                             (function, &*tipo)
                                         {
-                                            let mut generics_type_map: HashMap<u64, Arc<Type>> =
-                                                HashMap::new();
+                                            let mut generics_type_map: IndexMap<u64, Arc<Type>> =
+                                                IndexMap::new();
 
                                             let param_types = tipo.arg_types().unwrap();
 
@@ -2215,10 +2287,394 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        //Still to be defined
+        // Still to be defined
         for func in to_be_defined_map.clone().iter() {
             let index_scope = func_index_map.get(func.0).unwrap();
             func_index_map.insert(func.0.clone(), get_common_ancestor(func.1, index_scope));
+        }
+    }
+
+    fn convert_opaque_type_to_inner_ir(&mut self, ir_stack: &mut Vec<Air>) {
+        let mut indices_to_remove = vec![];
+        for (index, ir) in ir_stack.clone().into_iter().enumerate() {
+            match ir {
+                Air::Var {
+                    scope,
+                    constructor,
+                    name,
+                    variant_name,
+                } => {
+                    let mut replaced_type = constructor.tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::Var {
+                        scope,
+                        constructor: ValueConstructor {
+                            public: constructor.public,
+                            variant: constructor.variant,
+                            tipo: replaced_type,
+                        },
+                        name,
+                        variant_name,
+                    };
+                }
+                Air::List {
+                    tipo,
+                    scope,
+                    count,
+                    tail,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::List {
+                        scope,
+                        tipo: replaced_type,
+                        count,
+                        tail,
+                    };
+                }
+                Air::ListAccessor {
+                    tipo,
+                    scope,
+                    names,
+                    tail,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::ListAccessor {
+                        scope,
+                        tipo: replaced_type,
+                        names,
+                        tail,
+                    };
+                }
+                Air::ListExpose {
+                    tipo,
+                    scope,
+                    tail_head_names,
+                    tail,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::ListExpose {
+                        scope,
+                        tipo: replaced_type,
+                        tail_head_names,
+                        tail,
+                    };
+                }
+                Air::Builtin { tipo, scope, func } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::Builtin {
+                        scope,
+                        func,
+                        tipo: replaced_type,
+                    };
+                }
+                Air::BinOp {
+                    tipo,
+                    scope,
+                    name,
+                    count,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::BinOp {
+                        scope,
+                        name,
+                        count,
+                        tipo: replaced_type,
+                    };
+                }
+                Air::When {
+                    tipo,
+                    scope,
+                    subject_name,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::When {
+                        scope,
+                        tipo: replaced_type,
+                        subject_name,
+                    };
+                }
+                Air::Clause {
+                    tipo,
+                    scope,
+                    subject_name,
+                    complex_clause,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::Clause {
+                        scope,
+                        tipo: replaced_type,
+                        subject_name,
+                        complex_clause,
+                    };
+                }
+                Air::ListClause {
+                    tipo,
+                    scope,
+                    tail_name,
+                    next_tail_name,
+                    complex_clause,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::ListClause {
+                        scope,
+                        tipo: replaced_type,
+                        tail_name,
+                        next_tail_name,
+                        complex_clause,
+                    };
+                }
+                Air::TupleClause {
+                    tipo,
+                    scope,
+                    indices,
+                    predefined_indices,
+                    subject_name,
+                    count,
+                    complex_clause,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::TupleClause {
+                        scope,
+                        tipo: replaced_type,
+                        indices,
+                        predefined_indices,
+                        subject_name,
+                        count,
+                        complex_clause,
+                    };
+                }
+                Air::ClauseGuard {
+                    tipo,
+                    scope,
+                    subject_name,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::ClauseGuard {
+                        scope,
+                        subject_name,
+                        tipo: replaced_type,
+                    };
+                }
+                Air::ListClauseGuard {
+                    tipo,
+                    scope,
+                    tail_name,
+                    next_tail_name,
+                    inverse,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::ListClauseGuard {
+                        scope,
+                        tipo: replaced_type,
+                        tail_name,
+                        next_tail_name,
+                        inverse,
+                    };
+                }
+                Air::Tuple { tipo, scope, count } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::Tuple {
+                        scope,
+                        tipo: replaced_type,
+                        count,
+                    };
+                }
+                Air::TupleIndex {
+                    tipo,
+                    scope,
+                    tuple_index,
+                } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::TupleIndex {
+                        scope,
+                        tipo: replaced_type,
+                        tuple_index,
+                    };
+                }
+                Air::Todo { tipo, scope, label } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::Todo {
+                        scope,
+                        label,
+                        tipo: replaced_type,
+                    };
+                }
+                Air::ErrorTerm { tipo, scope, label } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::ErrorTerm {
+                        scope,
+                        tipo: replaced_type,
+                        label,
+                    };
+                }
+                Air::Trace { tipo, scope, text } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::Trace {
+                        scope,
+                        text,
+                        tipo: replaced_type,
+                    };
+                }
+                Air::TupleAccessor { tipo, scope, names } => {
+                    let mut replaced_type = tipo.clone();
+                    replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                    ir_stack[index] = Air::TupleAccessor {
+                        scope,
+                        names,
+                        tipo: replaced_type,
+                    };
+                }
+                Air::RecordUpdate {
+                    highest_index,
+                    indices,
+                    scope,
+                } => {
+                    let mut new_indices = vec![];
+                    for (ind, tipo) in indices {
+                        let mut replaced_type = tipo.clone();
+                        replace_opaque_type(&mut replaced_type, self.data_types.clone());
+                        new_indices.push((ind, replaced_type));
+                    }
+
+                    ir_stack[index] = Air::RecordUpdate {
+                        scope,
+                        indices: new_indices,
+                        highest_index,
+                    };
+                }
+                Air::Record {
+                    constr_index,
+                    tipo,
+                    count,
+                    scope,
+                } => {
+                    if check_replaceable_opaque_type(&tipo, self.data_types) {
+                        indices_to_remove.push(index);
+                    } else {
+                        let mut replaced_type = tipo.clone();
+                        replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                        ir_stack[index] = Air::Record {
+                            scope,
+                            constr_index,
+                            tipo: replaced_type,
+                            count,
+                        };
+                    }
+                }
+                Air::RecordAccess {
+                    record_index,
+                    tipo,
+                    scope,
+                } => {
+                    let record = ir_stack[index + 1].clone();
+                    let record_type = record.tipo();
+                    if let Some(record_type) = record_type {
+                        if check_replaceable_opaque_type(&record_type, self.data_types) {
+                            indices_to_remove.push(index);
+                        } else {
+                            let mut replaced_type = tipo.clone();
+                            replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                            ir_stack[index] = Air::RecordAccess {
+                                scope,
+                                record_index,
+                                tipo: replaced_type,
+                            };
+                        }
+                    } else {
+                        let mut replaced_type = tipo.clone();
+                        replace_opaque_type(&mut replaced_type, self.data_types.clone());
+
+                        ir_stack[index] = Air::RecordAccess {
+                            scope,
+                            record_index,
+                            tipo: replaced_type,
+                        };
+                    }
+                }
+                Air::FieldsExpose {
+                    count,
+                    indices,
+                    scope,
+                } => {
+                    let record = ir_stack[index + 1].clone();
+                    let record_type = record.tipo();
+                    if let Some(record_type) = record_type {
+                        if check_replaceable_opaque_type(&record_type, self.data_types) {
+                            ir_stack[index] = Air::Lam {
+                                scope,
+                                name: indices[0].1.clone(),
+                            };
+                        } else {
+                            let mut new_indices = vec![];
+                            for (ind, name, tipo) in indices {
+                                let mut replaced_type = tipo.clone();
+                                replace_opaque_type(&mut replaced_type, self.data_types.clone());
+                                new_indices.push((ind, name, replaced_type));
+                            }
+
+                            ir_stack[index] = Air::FieldsExpose {
+                                scope,
+                                indices: new_indices,
+                                count,
+                            };
+                        }
+                    } else {
+                        let mut new_indices = vec![];
+                        for (ind, name, tipo) in indices {
+                            let mut replaced_type = tipo.clone();
+                            replace_opaque_type(&mut replaced_type, self.data_types.clone());
+                            new_indices.push((ind, name, replaced_type));
+                        }
+
+                        ir_stack[index] = Air::FieldsExpose {
+                            scope,
+                            indices: new_indices,
+                            count,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for index in indices_to_remove.into_iter().rev() {
+            ir_stack.remove(index);
         }
     }
 
@@ -2248,6 +2704,10 @@ impl<'a> CodeGenerator<'a> {
             }
             Air::ByteArray { bytes, .. } => {
                 let term = Term::Constant(UplcConstant::ByteString(bytes));
+                arg_stack.push(term);
+            }
+            Air::Bool { value, .. } => {
+                let term = Term::Constant(UplcConstant::Bool(value));
                 arg_stack.push(term);
             }
             Air::Var {
@@ -2291,29 +2751,17 @@ impl<'a> CodeGenerator<'a> {
                         arity,
                         ..
                     } => {
-                        let data_type_key = match &*constructor.tipo {
-                            Type::App { module, name, .. } => DataTypeKey {
-                                module_name: module.to_string(),
-                                defined_type: name.to_string(),
-                            },
-                            Type::Fn { ret, .. } => match ret.deref() {
-                                Type::App { module, name, .. } => DataTypeKey {
-                                    module_name: module.to_string(),
-                                    defined_type: name.to_string(),
-                                },
-                                _ => unreachable!(),
-                            },
-                            Type::Var { .. } => todo!(),
-                            Type::Tuple { .. } => todo!(),
-                        };
-
                         if constructor.tipo.is_bool() {
                             arg_stack
                                 .push(Term::Constant(UplcConstant::Bool(constr_name == "True")));
                         } else if constructor.tipo.is_void() {
                             arg_stack.push(Term::Constant(UplcConstant::Unit));
                         } else {
-                            let data_type = self.data_types.get(&data_type_key).unwrap();
+                            let data_type = lookup_data_type_by_tipo(
+                                self.data_types.clone(),
+                                &constructor.tipo,
+                            )
+                            .unwrap();
 
                             let (constr_index, _) = data_type
                                 .constructors
@@ -2342,57 +2790,47 @@ impl<'a> CodeGenerator<'a> {
                                     .rev()
                                 {
                                     // TODO revisit
-                                    fields = Term::Apply {
-                                        function: Term::Apply {
-                                            function: Term::Builtin(DefaultFunction::MkCons)
-                                                .force_wrap()
-                                                .into(),
-                                            argument: convert_type_to_data(
+                                    fields = apply_wrap(
+                                        apply_wrap(
+                                            Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                            convert_type_to_data(
                                                 Term::Var(Name {
                                                     text: field.0 .0.clone(),
                                                     unique: 0.into(),
                                                 }),
                                                 field.1,
-                                            )
-                                            .into(),
-                                        }
-                                        .into(),
-                                        argument: fields.into(),
-                                    };
+                                            ),
+                                        ),
+                                        fields,
+                                    );
                                 }
                             } else {
                                 for (index, arg) in args_type.iter().enumerate().take(*arity) {
-                                    fields = Term::Apply {
-                                        function: Term::Apply {
-                                            function: Term::Builtin(DefaultFunction::MkCons)
-                                                .force_wrap()
-                                                .into(),
-                                            argument: convert_type_to_data(
+                                    fields = apply_wrap(
+                                        apply_wrap(
+                                            Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                            convert_type_to_data(
                                                 Term::Var(Name {
                                                     text: format!("__arg_{}", index),
                                                     unique: 0.into(),
                                                 }),
                                                 arg,
-                                            )
-                                            .into(),
-                                        }
-                                        .into(),
-                                        argument: fields.into(),
-                                    };
+                                            ),
+                                        ),
+                                        fields,
+                                    );
                                 }
                             }
 
-                            let mut term = Term::Apply {
-                                function: Term::Apply {
-                                    function: Term::Builtin(DefaultFunction::ConstrData).into(),
-                                    argument: Term::Constant(UplcConstant::Integer(
+                            let mut term = apply_wrap(
+                                apply_wrap(
+                                    Term::Builtin(DefaultFunction::ConstrData),
+                                    Term::Constant(UplcConstant::Integer(
                                         constr_index.try_into().unwrap(),
-                                    ))
-                                    .into(),
-                                }
-                                .into(),
-                                argument: fields.into(),
-                            };
+                                    )),
+                                ),
+                                fields,
+                            );
 
                             if let Some(field_map) = field_map {
                                 for field in field_map
@@ -2508,16 +2946,13 @@ impl<'a> CodeGenerator<'a> {
                         } else {
                             convert_type_to_data(arg, &list_type)
                         };
-                        term = Term::Apply {
-                            function: Term::Apply {
-                                function: Term::Builtin(DefaultFunction::MkCons)
-                                    .force_wrap()
-                                    .into(),
-                                argument: list_item.into(),
-                            }
-                            .into(),
-                            argument: term.into(),
-                        };
+                        term = apply_wrap(
+                            apply_wrap(
+                                Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                list_item,
+                            ),
+                            term,
+                        );
                     }
                     arg_stack.push(term);
                 }
@@ -2540,74 +2975,63 @@ impl<'a> CodeGenerator<'a> {
                 let list_id = self.id_gen.next();
 
                 let head_list = if tipo.is_map() {
-                    Term::Apply {
-                        function: Term::Force(Term::Builtin(DefaultFunction::HeadList).into())
-                            .into(),
-                        argument: Term::Var(Name {
+                    apply_wrap(
+                        Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                        Term::Var(Name {
                             text: format!("__list_{}", list_id),
                             unique: 0.into(),
-                        })
-                        .into(),
-                    }
+                        }),
+                    )
                 } else {
                     convert_data_to_type(
-                        Term::Apply {
-                            function: Term::Force(Term::Builtin(DefaultFunction::HeadList).into())
-                                .into(),
-                            argument: Term::Var(Name {
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                            Term::Var(Name {
                                 text: format!("__list_{}", list_id),
                                 unique: 0.into(),
-                            })
-                            .into(),
-                        },
+                            }),
+                        ),
                         &tipo.get_inner_types()[0],
                     )
                 };
 
-                term = Term::Apply {
-                    function: Term::Lambda {
+                term = apply_wrap(
+                    Term::Lambda {
                         parameter_name: Name {
                             text: format!("__list_{}", list_id),
                             unique: 0.into(),
                         },
-                        body: Term::Apply {
-                            function: Term::Lambda {
+                        body: apply_wrap(
+                            Term::Lambda {
                                 parameter_name: Name {
                                     text: first_name.clone(),
                                     unique: 0.into(),
                                 },
-                                body: Term::Apply {
-                                    function: list_access_to_uplc(
+                                body: apply_wrap(
+                                    list_access_to_uplc(
                                         names,
                                         &id_list,
                                         tail,
                                         current_index,
                                         term,
                                         &tipo,
-                                    )
-                                    .into(),
-                                    argument: Term::Apply {
-                                        function: Term::Builtin(DefaultFunction::TailList)
-                                            .force_wrap()
-                                            .into(),
-                                        argument: Term::Var(Name {
+                                    ),
+                                    apply_wrap(
+                                        Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                                        Term::Var(Name {
                                             text: format!("__list_{}", list_id),
                                             unique: 0.into(),
-                                        })
-                                        .into(),
-                                    }
-                                    .into(),
-                                }
+                                        }),
+                                    ),
+                                )
                                 .into(),
-                            }
-                            .into(),
-                            argument: head_list.into(),
-                        }
+                            },
+                            head_list,
+                        )
                         .into(),
-                    }
-                    .into(),
-                    argument: value.into(),
-                };
+                    },
+                    value,
+                );
 
                 arg_stack.push(term);
             }
@@ -2620,65 +3044,55 @@ impl<'a> CodeGenerator<'a> {
                 let mut term = arg_stack.pop().unwrap();
 
                 if let Some((tail_var, tail_name)) = tail {
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: tail_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::TailList).force_wrap().into(),
-                            argument: Term::Var(Name {
+                        },
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                            Term::Var(Name {
                                 text: tail_var,
                                 unique: 0.into(),
-                            })
-                            .into(),
-                        }
-                        .into(),
-                    };
+                            }),
+                        ),
+                    );
                 }
 
                 for (tail_var, head_name) in tail_head_names.into_iter().rev() {
                     let head_list = if tipo.is_map() {
-                        Term::Apply {
-                            function: Term::Force(Term::Builtin(DefaultFunction::HeadList).into())
-                                .into(),
-                            argument: Term::Var(Name {
+                        apply_wrap(
+                            Term::Force(Term::Builtin(DefaultFunction::HeadList).into()),
+                            Term::Var(Name {
                                 text: tail_var,
                                 unique: 0.into(),
-                            })
-                            .into(),
-                        }
+                            }),
+                        )
                     } else {
                         convert_data_to_type(
-                            Term::Apply {
-                                function: Term::Force(
-                                    Term::Builtin(DefaultFunction::HeadList).into(),
-                                )
-                                .into(),
-                                argument: Term::Var(Name {
+                            apply_wrap(
+                                Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                                Term::Var(Name {
                                     text: tail_var,
                                     unique: 0.into(),
-                                })
-                                .into(),
-                            },
+                                }),
+                            ),
                             &tipo.get_inner_types()[0],
                         )
                     };
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: head_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: head_list.into(),
-                    };
+                        },
+                        head_list,
+                    );
                 }
 
                 arg_stack.push(term);
@@ -2705,18 +3119,16 @@ impl<'a> CodeGenerator<'a> {
                     for _ in 0..count {
                         let arg = arg_stack.pop().unwrap();
 
-                        term = Term::Apply {
-                            function: term.into(),
-                            argument: arg.into(),
-                        };
+                        term = apply_wrap(term, arg);
                     }
                     arg_stack.push(term);
                 } else {
                     let term = arg_stack.pop().unwrap();
 
                     let zero_arg_functions = self.zero_arg_functions.clone();
+                    let mut anon_func = true;
 
-                    if let Term::Var(Name { text, .. }) = term {
+                    if let Term::Var(Name { text, .. }) = term.clone() {
                         for (
                             FunctionAccessKey {
                                 module_name,
@@ -2750,8 +3162,12 @@ impl<'a> CodeGenerator<'a> {
                                     eval_program.eval(ExBudget::default()).0.unwrap();
 
                                 arg_stack.push(evaluated_term.try_into().unwrap());
+                                anon_func = false;
                             }
                         }
+                    }
+                    if anon_func {
+                        arg_stack.push(term);
                     }
                 }
             }
@@ -2763,14 +3179,13 @@ impl<'a> CodeGenerator<'a> {
                         term = term.force_wrap();
                     }
 
-                    term = Term::Apply {
-                        function: term.into(),
-                        argument: Term::Var(Name {
+                    term = apply_wrap(
+                        term,
+                        Term::Var(Name {
                             text: format!("__arg_{}", id),
                             unique: 0.into(),
-                        })
-                        .into(),
-                    };
+                        }),
+                    );
 
                     let inner_type = if matches!(func, DefaultFunction::SndPair) {
                         tipo.get_inner_types()[0].get_inner_types()[1].clone()
@@ -2835,97 +3250,68 @@ impl<'a> CodeGenerator<'a> {
                             arg_stack.push(term);
                             return;
                         } else if tipo.is_map() {
-                            let term = Term::Apply {
-                                function: Term::Apply {
-                                    function: default_builtin.into(),
-                                    argument: Term::Apply {
-                                        function: DefaultFunction::MapData.into(),
-                                        argument: left.into(),
-                                    }
-                                    .into(),
-                                }
-                                .into(),
-                                argument: Term::Apply {
-                                    function: DefaultFunction::MapData.into(),
-                                    argument: right.into(),
-                                }
-                                .into(),
-                            };
+                            let term = apply_wrap(
+                                apply_wrap(
+                                    default_builtin.into(),
+                                    apply_wrap(DefaultFunction::MapData.into(), left),
+                                ),
+                                apply_wrap(DefaultFunction::MapData.into(), right),
+                            );
+
                             arg_stack.push(term);
                             return;
                         } else if tipo.is_tuple()
                             && matches!(tipo.clone().get_uplc_type(), UplcType::Pair(_, _))
                         {
-                            let term = Term::Apply {
-                                function: Term::Apply {
-                                    function: default_builtin.into(),
-                                    argument: Term::Apply {
-                                        function: DefaultFunction::MapData.into(),
-                                        argument: Term::Apply {
-                                            function: Term::Apply {
-                                                function: Term::Builtin(DefaultFunction::MkCons)
-                                                    .force_wrap()
-                                                    .into(),
-                                                argument: left.into(),
-                                            }
-                                            .into(),
-                                            argument: Term::Constant(UplcConstant::ProtoList(
+                            let term = apply_wrap(
+                                apply_wrap(
+                                    default_builtin.into(),
+                                    apply_wrap(
+                                        DefaultFunction::MapData.into(),
+                                        apply_wrap(
+                                            apply_wrap(
+                                                Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                                left,
+                                            ),
+                                            Term::Constant(UplcConstant::ProtoList(
                                                 UplcType::Pair(
                                                     UplcType::Data.into(),
                                                     UplcType::Data.into(),
                                                 ),
                                                 vec![],
-                                            ))
-                                            .into(),
-                                        }
-                                        .into(),
-                                    }
-                                    .into(),
-                                }
-                                .into(),
-                                argument: Term::Apply {
-                                    function: DefaultFunction::MapData.into(),
-                                    argument: Term::Apply {
-                                        function: Term::Apply {
-                                            function: Term::Builtin(DefaultFunction::MkCons)
-                                                .force_wrap()
-                                                .into(),
-                                            argument: right.into(),
-                                        }
-                                        .into(),
-                                        argument: Term::Constant(UplcConstant::ProtoList(
+                                            )),
+                                        ),
+                                    ),
+                                ),
+                                apply_wrap(
+                                    DefaultFunction::MapData.into(),
+                                    apply_wrap(
+                                        apply_wrap(
+                                            Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                            right,
+                                        ),
+                                        Term::Constant(UplcConstant::ProtoList(
                                             UplcType::Pair(
                                                 UplcType::Data.into(),
                                                 UplcType::Data.into(),
                                             ),
                                             vec![],
-                                        ))
-                                        .into(),
-                                    }
-                                    .into(),
-                                }
-                                .into(),
-                            };
+                                        )),
+                                    ),
+                                ),
+                            );
+
                             arg_stack.push(term);
                             return;
-                        } else if tipo.is_list() {
-                            let term = Term::Apply {
-                                function: Term::Apply {
-                                    function: default_builtin.into(),
-                                    argument: Term::Apply {
-                                        function: DefaultFunction::ListData.into(),
-                                        argument: left.into(),
-                                    }
-                                    .into(),
-                                }
-                                .into(),
+                        } else if tipo.is_list() || tipo.is_tuple() {
+                            let term = apply_wrap(
+                                apply_wrap(
+                                    default_builtin.into(),
+                                    apply_wrap(DefaultFunction::ListData.into(), left),
+                                ),
+                                apply_wrap(DefaultFunction::ListData.into(), right),
+                            );
 
-                                argument: Term::Apply {
-                                    function: DefaultFunction::ListData.into(),
-                                    argument: right.into(),
-                                }
-                                .into(),
-                            };
                             arg_stack.push(term);
                             return;
                         } else if tipo.is_void() {
@@ -2933,14 +3319,7 @@ impl<'a> CodeGenerator<'a> {
                             return;
                         }
 
-                        Term::Apply {
-                            function: Term::Apply {
-                                function: default_builtin.into(),
-                                argument: left.into(),
-                            }
-                            .into(),
-                            argument: right.into(),
-                        }
+                        apply_wrap(apply_wrap(default_builtin.into(), left), right)
                     }
                     BinOp::NotEq => {
                         if tipo.is_bool() {
@@ -2956,87 +3335,60 @@ impl<'a> CodeGenerator<'a> {
                             arg_stack.push(term);
                             return;
                         } else if tipo.is_map() {
-                            let term = Term::Apply {
-                                function: Term::Apply {
-                                    function: Term::Apply {
-                                        function: Term::Builtin(DefaultFunction::IfThenElse)
-                                            .force_wrap()
-                                            .into(),
-                                        argument: Term::Apply {
-                                            function: Term::Apply {
-                                                function: default_builtin.into(),
-                                                argument: Term::Apply {
-                                                    function: DefaultFunction::MapData.into(),
-                                                    argument: left.into(),
-                                                }
-                                                .into(),
-                                            }
-                                            .into(),
-                                            argument: Term::Apply {
-                                                function: DefaultFunction::MapData.into(),
-                                                argument: right.into(),
-                                            }
-                                            .into(),
-                                        }
-                                        .into(),
-                                    }
-                                    .into(),
-                                    argument: Term::Constant(UplcConstant::Bool(false)).into(),
-                                }
-                                .into(),
-                                argument: Term::Constant(UplcConstant::Bool(true)).into(),
-                            };
+                            let term = if_else(
+                                apply_wrap(
+                                    apply_wrap(
+                                        default_builtin.into(),
+                                        apply_wrap(DefaultFunction::MapData.into(), left),
+                                    ),
+                                    apply_wrap(DefaultFunction::MapData.into(), right),
+                                ),
+                                Term::Constant(UplcConstant::Bool(false)),
+                                Term::Constant(UplcConstant::Bool(true)),
+                            );
+
                             arg_stack.push(term);
                             return;
                         } else if tipo.is_tuple()
                             && matches!(tipo.clone().get_uplc_type(), UplcType::Pair(_, _))
                         {
-                            let mut term = Term::Apply {
-                                function: Term::Apply {
-                                    function: default_builtin.into(),
-                                    argument: Term::Apply {
-                                        function: DefaultFunction::MapData.into(),
-                                        argument: Term::Apply {
-                                            function: Term::Apply {
-                                                function: Term::Builtin(DefaultFunction::MkCons)
-                                                    .force_wrap()
-                                                    .into(),
-                                                argument: left.into(),
-                                            }
-                                            .into(),
-                                            argument: Term::Constant(UplcConstant::ProtoList(
+                            let mut term = apply_wrap(
+                                apply_wrap(
+                                    default_builtin.into(),
+                                    apply_wrap(
+                                        DefaultFunction::MapData.into(),
+                                        apply_wrap(
+                                            apply_wrap(
+                                                Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                                left,
+                                            ),
+                                            Term::Constant(UplcConstant::ProtoList(
                                                 UplcType::Pair(
                                                     UplcType::Data.into(),
                                                     UplcType::Data.into(),
                                                 ),
                                                 vec![],
-                                            ))
-                                            .into(),
-                                        }
-                                        .into(),
-                                    }
-                                    .into(),
-                                }
-                                .into(),
-                                argument: Term::Apply {
-                                    function: Term::Apply {
-                                        function: Term::Builtin(DefaultFunction::MkCons)
-                                            .force_wrap()
-                                            .into(),
-                                        argument: right.into(),
-                                    }
-                                    .into(),
-                                    argument: Term::Constant(UplcConstant::ProtoList(
-                                        UplcType::Pair(
-                                            UplcType::Data.into(),
-                                            UplcType::Data.into(),
+                                            )),
                                         ),
-                                        vec![],
-                                    ))
-                                    .into(),
-                                }
-                                .into(),
-                            };
+                                    ),
+                                ),
+                                apply_wrap(
+                                    DefaultFunction::MapData.into(),
+                                    apply_wrap(
+                                        apply_wrap(
+                                            Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                            right,
+                                        ),
+                                        Term::Constant(UplcConstant::ProtoList(
+                                            UplcType::Pair(
+                                                UplcType::Data.into(),
+                                                UplcType::Data.into(),
+                                            ),
+                                            vec![],
+                                        )),
+                                    ),
+                                ),
+                            );
 
                             term = if_else(
                                 term,
@@ -3045,28 +3397,15 @@ impl<'a> CodeGenerator<'a> {
                             );
                             arg_stack.push(term);
                             return;
-                        } else if tipo.is_list() {
+                        } else if tipo.is_list() || tipo.is_tuple() {
                             let term = if_else(
-                                Term::Apply {
-                                    function: Term::Apply {
-                                        function: default_builtin.into(),
-                                        argument: Term::Apply {
-                                            function: DefaultFunction::ListData.into(),
-                                            argument: left.into(),
-                                        }
-                                        .into(),
-                                    }
-                                    .into(),
-                                    argument: Term::Apply {
-                                        function: default_builtin.into(),
-                                        argument: Term::Apply {
-                                            function: DefaultFunction::ListData.into(),
-                                            argument: right.into(),
-                                        }
-                                        .into(),
-                                    }
-                                    .into(),
-                                },
+                                apply_wrap(
+                                    apply_wrap(
+                                        default_builtin.into(),
+                                        apply_wrap(DefaultFunction::ListData.into(), left),
+                                    ),
+                                    apply_wrap(DefaultFunction::ListData.into(), right),
+                                ),
                                 Term::Constant(UplcConstant::Bool(false)),
                                 Term::Constant(UplcConstant::Bool(true)),
                             );
@@ -3078,101 +3417,47 @@ impl<'a> CodeGenerator<'a> {
                             return;
                         }
 
-                        Term::Apply {
-                            function: Term::Apply {
-                                function: Term::Apply {
-                                    function: Term::Builtin(DefaultFunction::IfThenElse)
-                                        .force_wrap()
-                                        .into(),
-                                    argument: Term::Apply {
-                                        function: Term::Apply {
-                                            function: default_builtin.into(),
-                                            argument: left.into(),
-                                        }
-                                        .into(),
-                                        argument: right.into(),
-                                    }
-                                    .into(),
-                                }
-                                .into(),
-                                argument: Term::Constant(UplcConstant::Bool(false)).into(),
-                            }
-                            .into(),
-                            argument: Term::Constant(UplcConstant::Bool(true)).into(),
-                        }
+                        if_else(
+                            apply_wrap(apply_wrap(default_builtin.into(), left), right),
+                            Term::Constant(UplcConstant::Bool(false)),
+                            Term::Constant(UplcConstant::Bool(true)),
+                        )
                     }
-                    BinOp::LtInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::LessThanInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
-                    BinOp::LtEqInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::LessThanEqualsInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
-                    BinOp::GtEqInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::LessThanEqualsInteger).into(),
-                            argument: right.into(),
-                        }
-                        .into(),
-                        argument: left.into(),
-                    },
-                    BinOp::GtInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::LessThanInteger).into(),
-                            argument: right.into(),
-                        }
-                        .into(),
-                        argument: left.into(),
-                    },
-                    BinOp::AddInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::AddInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
-                    BinOp::SubInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::SubtractInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
-                    BinOp::MultInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::MultiplyInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
-                    BinOp::DivInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::DivideInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
-                    BinOp::ModInt => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::ModInteger).into(),
-                            argument: left.into(),
-                        }
-                        .into(),
-                        argument: right.into(),
-                    },
+                    BinOp::LtInt => apply_wrap(
+                        apply_wrap(DefaultFunction::LessThanInteger.into(), left),
+                        right,
+                    ),
+
+                    BinOp::LtEqInt => apply_wrap(
+                        apply_wrap(DefaultFunction::LessThanEqualsInteger.into(), left),
+                        right,
+                    ),
+                    BinOp::GtEqInt => apply_wrap(
+                        apply_wrap(DefaultFunction::LessThanEqualsInteger.into(), right),
+                        left,
+                    ),
+                    BinOp::GtInt => apply_wrap(
+                        apply_wrap(DefaultFunction::LessThanInteger.into(), right),
+                        left,
+                    ),
+                    BinOp::AddInt => {
+                        apply_wrap(apply_wrap(DefaultFunction::AddInteger.into(), left), right)
+                    }
+                    BinOp::SubInt => apply_wrap(
+                        apply_wrap(DefaultFunction::SubtractInteger.into(), left),
+                        right,
+                    ),
+                    BinOp::MultInt => apply_wrap(
+                        apply_wrap(DefaultFunction::MultiplyInteger.into(), left),
+                        right,
+                    ),
+                    BinOp::DivInt => apply_wrap(
+                        apply_wrap(DefaultFunction::DivideInteger.into(), left),
+                        right,
+                    ),
+                    BinOp::ModInt => {
+                        apply_wrap(apply_wrap(DefaultFunction::ModInteger.into(), left), right)
+                    }
                 };
                 arg_stack.push(term);
             }
@@ -3180,17 +3465,42 @@ impl<'a> CodeGenerator<'a> {
                 let right_hand = arg_stack.pop().unwrap();
                 let lam_body = arg_stack.pop().unwrap();
 
-                let term = Term::Apply {
-                    function: Term::Lambda {
+                let term = apply_wrap(
+                    Term::Lambda {
                         parameter_name: Name {
                             text: name,
                             unique: 0.into(),
                         },
                         body: lam_body.into(),
-                    }
-                    .into(),
-                    argument: right_hand.into(),
-                };
+                    },
+                    right_hand,
+                );
+
+                arg_stack.push(term);
+            }
+            Air::Assert { constr_index, .. } => {
+                let constr = arg_stack.pop().unwrap();
+
+                let mut term = arg_stack.pop().unwrap();
+
+                let trace_error = apply_wrap(
+                    apply_wrap(
+                        Term::Builtin(DefaultFunction::Trace).force_wrap(),
+                        Term::Constant(UplcConstant::String("Assert Failed".to_string())),
+                    ),
+                    Term::Delay(Term::Error.into()),
+                )
+                .force_wrap();
+
+                let condition = apply_wrap(
+                    apply_wrap(
+                        DefaultFunction::EqualsInteger.into(),
+                        Term::Constant(UplcConstant::Integer(constr_index as i128)),
+                    ),
+                    constr_index_exposer(constr),
+                );
+
+                term = delayed_if_else(condition, term, trace_error);
 
                 arg_stack.push(term);
             }
@@ -3222,17 +3532,17 @@ impl<'a> CodeGenerator<'a> {
                 }
 
                 if !recursive {
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: func_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: func_body.into(),
-                    };
+                        },
+                        func_body,
+                    );
+
                     arg_stack.push(term);
                 } else {
                     func_body = Term::Lambda {
@@ -3243,63 +3553,55 @@ impl<'a> CodeGenerator<'a> {
                         body: func_body.into(),
                     };
 
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: func_name.clone(),
                                 unique: 0.into(),
                             },
-                            body: Term::Apply {
-                                function: Term::Lambda {
+                            body: apply_wrap(
+                                Term::Lambda {
                                     parameter_name: Name {
                                         text: func_name.clone(),
                                         unique: 0.into(),
                                     },
                                     body: term.into(),
-                                }
-                                .into(),
-                                argument: Term::Apply {
-                                    function: Term::Var(Name {
+                                },
+                                apply_wrap(
+                                    Term::Var(Name {
                                         text: func_name.clone(),
                                         unique: 0.into(),
-                                    })
-                                    .into(),
-                                    argument: Term::Var(Name {
+                                    }),
+                                    Term::Var(Name {
                                         text: func_name,
                                         unique: 0.into(),
-                                    })
-                                    .into(),
-                                }
-                                .into(),
-                            }
+                                    }),
+                                ),
+                            )
                             .into(),
-                        }
-                        .into(),
-                        argument: func_body.into(),
-                    };
+                        },
+                        func_body,
+                    );
 
                     arg_stack.push(term);
                 }
             }
-            Air::DefineConst { .. } => todo!(),
-            Air::DefineConstrFields { .. } => todo!(),
-            Air::DefineConstrFieldAccess { .. } => todo!(),
             Air::Lam { name, .. } => {
                 let arg = arg_stack.pop().unwrap();
 
                 let mut term = arg_stack.pop().unwrap();
 
-                term = Term::Apply {
-                    function: Term::Lambda {
+                term = apply_wrap(
+                    Term::Lambda {
                         parameter_name: Name {
                             text: name,
                             unique: 0.into(),
                         },
                         body: term.into(),
-                    }
-                    .into(),
-                    argument: arg.into(),
-                };
+                    },
+                    arg,
+                );
+
                 arg_stack.push(term);
             }
             Air::When {
@@ -3314,30 +3616,29 @@ impl<'a> CodeGenerator<'a> {
                     || tipo.is_string()
                     || tipo.is_list()
                     || tipo.is_tuple()
+                    || tipo.is_bool()
                 {
-                    Term::Apply {
-                        function: Term::Lambda {
+                    apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: subject_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: subject.into(),
-                    }
+                        },
+                        subject,
+                    )
                 } else {
-                    Term::Apply {
-                        function: Term::Lambda {
+                    apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: subject_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: constr_index_exposer(subject).into(),
-                    }
+                        },
+                        constr_index_exposer(subject),
+                    )
                 };
 
                 arg_stack.push(term);
@@ -3357,81 +3658,86 @@ impl<'a> CodeGenerator<'a> {
                 // the next branch in the when expression
                 let mut term = arg_stack.pop().unwrap();
 
-                let checker = if tipo.is_int() {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsInteger.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                } else if tipo.is_bytearray() {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsByteString.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                } else if tipo.is_bool() {
-                    todo!()
-                } else if tipo.is_string() {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsString.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                } else if tipo.is_list() {
-                    unreachable!()
-                } else {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsInteger.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                };
-
-                if complex_clause {
-                    term = Term::Apply {
-                        function: Term::Lambda {
-                            parameter_name: Name {
-                                text: "__other_clauses_delayed".to_string(),
+                if tipo.is_bool() {
+                    if matches!(clause, Term::Constant(UplcConstant::Bool(true))) {
+                        term = delayed_if_else(
+                            Term::Var(Name {
+                                text: subject_name,
                                 unique: 0.into(),
-                            },
-                            body: if_else(
-                                Term::Apply {
-                                    function: checker.into(),
-                                    argument: clause.into(),
-                                },
-                                Term::Delay(body.into()),
-                                Term::Var(Name {
+                            }),
+                            body,
+                            term,
+                        );
+                    } else {
+                        term = delayed_if_else(
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                            term,
+                            body,
+                        );
+                    }
+                } else {
+                    let checker = if tipo.is_int() {
+                        apply_wrap(
+                            DefaultFunction::EqualsInteger.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    } else if tipo.is_bytearray() {
+                        apply_wrap(
+                            DefaultFunction::EqualsByteString.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    } else if tipo.is_string() {
+                        apply_wrap(
+                            DefaultFunction::EqualsString.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    } else if tipo.is_list() || tipo.is_tuple() {
+                        unreachable!()
+                    } else {
+                        apply_wrap(
+                            DefaultFunction::EqualsInteger.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    };
+
+                    if complex_clause {
+                        term = apply_wrap(
+                            Term::Lambda {
+                                parameter_name: Name {
                                     text: "__other_clauses_delayed".to_string(),
                                     unique: 0.into(),
-                                }),
-                            )
-                            .force_wrap()
-                            .into(),
-                        }
-                        .into(),
-                        argument: Term::Delay(term.into()).into(),
+                                },
+                                body: if_else(
+                                    apply_wrap(checker, clause),
+                                    Term::Delay(body.into()),
+                                    Term::Var(Name {
+                                        text: "__other_clauses_delayed".to_string(),
+                                        unique: 0.into(),
+                                    }),
+                                )
+                                .force_wrap()
+                                .into(),
+                            },
+                            Term::Delay(term.into()),
+                        );
+                    } else {
+                        term = delayed_if_else(apply_wrap(checker, clause), body, term);
                     }
-                } else {
-                    term = delayed_if_else(
-                        Term::Apply {
-                            function: checker.into(),
-                            argument: clause.into(),
-                        },
-                        body,
-                        term,
-                    );
                 }
 
                 arg_stack.push(term);
@@ -3449,25 +3755,22 @@ impl<'a> CodeGenerator<'a> {
                 let mut term = arg_stack.pop().unwrap();
 
                 let arg = if let Some(next_tail_name) = next_tail_name {
-                    Term::Apply {
-                        function: Term::Lambda {
+                    apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: next_tail_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::TailList).force_wrap().into(),
-                            argument: Term::Var(Name {
+                        },
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                            Term::Var(Name {
                                 text: tail_name.clone(),
                                 unique: 0.into(),
-                            })
-                            .into(),
-                        }
-                        .into(),
-                    }
+                            }),
+                        ),
+                    )
                 } else {
                     term
                 };
@@ -3486,17 +3789,16 @@ impl<'a> CodeGenerator<'a> {
                     )
                     .force_wrap();
 
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: "__other_clauses_delayed".into(),
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: Term::Delay(arg.into()).into(),
-                    };
+                        },
+                        Term::Delay(arg.into()),
+                    );
                 } else {
                     term = delayed_choose_list(
                         Term::Var(Name {
@@ -3510,6 +3812,25 @@ impl<'a> CodeGenerator<'a> {
 
                 arg_stack.push(term);
             }
+
+            Air::WrapClause { .. } => {
+                let _ = arg_stack.pop().unwrap();
+
+                let mut term = arg_stack.pop().unwrap();
+                let arg = arg_stack.pop().unwrap();
+
+                term = apply_wrap(
+                    Term::Lambda {
+                        parameter_name: Name {
+                            text: "__other_clauses_delayed".into(),
+                            unique: 0.into(),
+                        },
+                        body: term.into(),
+                    },
+                    Term::Delay(arg.into()),
+                );
+                arg_stack.push(term);
+            }
             Air::ClauseGuard {
                 subject_name, tipo, ..
             } => {
@@ -3517,62 +3838,81 @@ impl<'a> CodeGenerator<'a> {
 
                 let then = arg_stack.pop().unwrap();
 
-                let checker = if tipo.is_int() {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsInteger.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                } else if tipo.is_bytearray() {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsByteString.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                } else if tipo.is_bool() {
-                    todo!()
-                } else if tipo.is_string() {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsString.into(),
-                        argument: Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        })
-                        .into(),
-                    }
-                } else if tipo.is_list() {
-                    unreachable!()
-                } else {
-                    Term::Apply {
-                        function: DefaultFunction::EqualsInteger.into(),
-                        argument: constr_index_exposer(Term::Var(Name {
-                            text: subject_name,
-                            unique: 0.into(),
-                        }))
-                        .into(),
-                    }
-                };
-
-                let term = if_else(
-                    Term::Apply {
-                        function: checker.into(),
-                        argument: condition.into(),
-                    },
-                    Term::Delay(then.into()),
-                    Term::Var(Name {
+                if tipo.is_bool() {
+                    let mut term = Term::Var(Name {
                         text: "__other_clauses_delayed".to_string(),
                         unique: 0.into(),
-                    }),
-                )
-                .force_wrap();
+                    });
+                    if matches!(condition, Term::Constant(UplcConstant::Bool(true))) {
+                        term = if_else(
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                            Term::Delay(then.into()),
+                            term,
+                        )
+                        .force_wrap();
+                    } else {
+                        term = if_else(
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                            term,
+                            Term::Delay(then.into()),
+                        )
+                        .force_wrap();
+                    }
+                    arg_stack.push(term);
+                } else {
+                    let checker = if tipo.is_int() {
+                        apply_wrap(
+                            DefaultFunction::EqualsInteger.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    } else if tipo.is_bytearray() {
+                        apply_wrap(
+                            DefaultFunction::EqualsByteString.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    } else if tipo.is_string() {
+                        apply_wrap(
+                            DefaultFunction::EqualsString.into(),
+                            Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            }),
+                        )
+                    } else if tipo.is_list() || tipo.is_tuple() {
+                        unreachable!()
+                    } else {
+                        apply_wrap(
+                            DefaultFunction::EqualsInteger.into(),
+                            constr_index_exposer(Term::Var(Name {
+                                text: subject_name,
+                                unique: 0.into(),
+                            })),
+                        )
+                    };
 
-                arg_stack.push(term);
+                    let term = if_else(
+                        apply_wrap(checker, condition),
+                        Term::Delay(then.into()),
+                        Term::Var(Name {
+                            text: "__other_clauses_delayed".to_string(),
+                            unique: 0.into(),
+                        }),
+                    )
+                    .force_wrap();
+                    arg_stack.push(term);
+                }
             }
             Air::ListClauseGuard {
                 tail_name,
@@ -3588,25 +3928,22 @@ impl<'a> CodeGenerator<'a> {
                 let mut term = arg_stack.pop().unwrap();
 
                 term = if let Some(next_tail_name) = next_tail_name {
-                    Term::Apply {
-                        function: Term::Lambda {
+                    apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: next_tail_name,
                                 unique: 0.into(),
                             },
                             body: term.into(),
-                        }
-                        .into(),
-                        argument: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::TailList).force_wrap().into(),
-                            argument: Term::Var(Name {
+                        },
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                            Term::Var(Name {
                                 text: tail_name.clone(),
                                 unique: 0.into(),
-                            })
-                            .into(),
-                        }
-                        .into(),
-                    }
+                            }),
+                        ),
+                    )
                 } else {
                     term
                 };
@@ -3653,31 +3990,77 @@ impl<'a> CodeGenerator<'a> {
 
                 arg_stack.push(term);
             }
-            Air::Constr { .. } => todo!(),
-            Air::Fields { .. } => todo!(),
-            Air::RecordAccess { index, tipo, .. } => {
+            Air::Record {
+                constr_index,
+                tipo,
+                count,
+                ..
+            } => {
+                let mut arg_vec = vec![];
+                for _ in 0..count {
+                    arg_vec.push(arg_stack.pop().unwrap());
+                }
+
+                let mut term = Term::Constant(UplcConstant::ProtoList(UplcType::Data, vec![]));
+
+                for (index, arg) in arg_vec.iter().enumerate().rev() {
+                    term = apply_wrap(
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                            convert_type_to_data(arg.clone(), &tipo.arg_types().unwrap()[index]),
+                        ),
+                        term,
+                    );
+                }
+
+                term = apply_wrap(
+                    apply_wrap(
+                        DefaultFunction::ConstrData.into(),
+                        Term::Constant(UplcConstant::Integer(constr_index as i128)),
+                    ),
+                    term,
+                );
+
+                if arg_vec.iter().all(|item| matches!(item, Term::Constant(_))) {
+                    let mut program: Program<Name> = Program {
+                        version: (1, 0, 0),
+                        term,
+                    };
+
+                    let mut interner = Interner::new();
+
+                    interner.program(&mut program);
+
+                    let eval_program: Program<NamedDeBruijn> = program.try_into().unwrap();
+
+                    let evaluated_term: Term<NamedDeBruijn> =
+                        eval_program.eval(ExBudget::default()).0.unwrap();
+                    term = evaluated_term.try_into().unwrap();
+                }
+
+                arg_stack.push(term);
+            }
+            Air::RecordAccess {
+                record_index, tipo, ..
+            } => {
                 let constr = arg_stack.pop().unwrap();
 
-                let mut term = Term::Apply {
-                    function: Term::Apply {
-                        function: Term::Var(Name {
+                let mut term = apply_wrap(
+                    apply_wrap(
+                        Term::Var(Name {
                             text: CONSTR_GET_FIELD.to_string(),
                             unique: 0.into(),
-                        })
-                        .into(),
-                        argument: Term::Apply {
-                            function: Term::Var(Name {
+                        }),
+                        apply_wrap(
+                            Term::Var(Name {
                                 text: CONSTR_FIELDS_EXPOSER.to_string(),
                                 unique: 0.into(),
-                            })
-                            .into(),
-                            argument: constr.into(),
-                        }
-                        .into(),
-                    }
-                    .into(),
-                    argument: Term::Constant(UplcConstant::Integer(index.into())).into(),
-                };
+                            }),
+                            constr,
+                        ),
+                    ),
+                    Term::Constant(UplcConstant::Integer(record_index.into())),
+                );
 
                 term = convert_data_to_type(term, &tipo);
 
@@ -3711,24 +4094,22 @@ impl<'a> CodeGenerator<'a> {
                     unique: 0.into(),
                 });
 
-                body = Term::Apply {
-                    function: Term::Lambda {
+                body = apply_wrap(
+                    Term::Lambda {
                         parameter_name: Name {
                             text: highest.1,
                             unique: 0.into(),
                         },
                         body: body.into(),
-                    }
-                    .into(),
-                    argument: convert_data_to_type(
-                        Term::Apply {
-                            function: Term::Builtin(DefaultFunction::HeadList).force_wrap().into(),
-                            argument: last_prev_tail.into(),
-                        },
+                    },
+                    convert_data_to_type(
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                            last_prev_tail,
+                        ),
                         &highest.2,
-                    )
-                    .into(),
-                };
+                    ),
+                );
 
                 let mut current_field = None;
                 for index in (0..highest.0).rev() {
@@ -3755,23 +4136,21 @@ impl<'a> CodeGenerator<'a> {
                     if let Some(ref field) = current_field {
                         if field.0 == index {
                             let unwrapper = convert_data_to_type(
-                                Term::Apply {
-                                    function: Term::Builtin(DefaultFunction::HeadList)
-                                        .force_wrap()
-                                        .into(),
-                                    argument: prev_tail.clone().into(),
-                                },
+                                apply_wrap(
+                                    Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                                    prev_tail.clone(),
+                                ),
                                 &field.2,
                             );
 
-                            body = Term::Apply {
-                                function: Term::Lambda {
+                            body = apply_wrap(
+                                Term::Lambda {
                                     parameter_name: Name {
                                         text: field.1.clone(),
                                         unique: 0.into(),
                                     },
-                                    body: Term::Apply {
-                                        function: Term::Lambda {
+                                    body: apply_wrap(
+                                        Term::Lambda {
                                             parameter_name: Name {
                                                 text: format!(
                                                     "__tail_{current_tail_index}_{current_tail_id}"
@@ -3779,26 +4158,21 @@ impl<'a> CodeGenerator<'a> {
                                                 unique: 0.into(),
                                             },
                                             body: body.into(),
-                                        }
-                                        .into(),
-                                        argument: Term::Apply {
-                                            function: Term::Builtin(DefaultFunction::TailList)
-                                                .force_wrap()
-                                                .into(),
-                                            argument: prev_tail.into(),
-                                        }
-                                        .into(),
-                                    }
+                                        },
+                                        apply_wrap(
+                                            Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                                            prev_tail,
+                                        ),
+                                    )
                                     .into(),
-                                }
-                                .into(),
-                                argument: unwrapper.into(),
-                            };
+                                },
+                                unwrapper,
+                            );
 
                             current_field = None;
                         } else {
-                            body = Term::Apply {
-                                function: Term::Lambda {
+                            body = apply_wrap(
+                                Term::Lambda {
                                     parameter_name: Name {
                                         text: format!(
                                             "__tail_{current_tail_index}_{current_tail_id}"
@@ -3806,57 +4180,46 @@ impl<'a> CodeGenerator<'a> {
                                         unique: 0.into(),
                                     },
                                     body: body.into(),
-                                }
-                                .into(),
-                                argument: Term::Apply {
-                                    function: Term::Builtin(DefaultFunction::TailList)
-                                        .force_wrap()
-                                        .into(),
-                                    argument: prev_tail.into(),
-                                }
-                                .into(),
-                            }
+                                },
+                                apply_wrap(
+                                    Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                                    prev_tail,
+                                ),
+                            );
                         }
                     } else {
-                        body = Term::Apply {
-                            function: Term::Lambda {
+                        body = apply_wrap(
+                            Term::Lambda {
                                 parameter_name: Name {
                                     text: format!("__tail_{current_tail_index}_{current_tail_id}"),
                                     unique: 0.into(),
                                 },
                                 body: body.into(),
-                            }
-                            .into(),
-                            argument: Term::Apply {
-                                function: Term::Builtin(DefaultFunction::TailList)
-                                    .force_wrap()
-                                    .into(),
-                                argument: prev_tail.into(),
-                            }
-                            .into(),
-                        }
+                            },
+                            apply_wrap(
+                                Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                                prev_tail,
+                            ),
+                        );
                     }
                 }
 
-                body = Term::Apply {
-                    function: Term::Lambda {
+                body = apply_wrap(
+                    Term::Lambda {
                         parameter_name: Name {
                             text: constr_name_lam,
                             unique: 0.into(),
                         },
                         body: body.into(),
-                    }
-                    .into(),
-                    argument: Term::Apply {
-                        function: Term::Var(Name {
+                    },
+                    apply_wrap(
+                        Term::Var(Name {
                             text: CONSTR_FIELDS_EXPOSER.to_string(),
                             unique: 0.into(),
-                        })
-                        .into(),
-                        argument: constr_var.into(),
-                    }
-                    .into(),
-                };
+                        }),
+                        constr_var,
+                    ),
+                );
 
                 arg_stack.push(body);
             }
@@ -3893,51 +4256,193 @@ impl<'a> CodeGenerator<'a> {
                         arg_stack.push(term);
                     }
                 } else if count == 2 {
-                    let term = Term::Apply {
-                        function: Term::Apply {
-                            function: DefaultFunction::MkPairData.into(),
-                            argument: convert_type_to_data(args[0].clone(), &tuple_sub_types[0])
-                                .into(),
-                        }
-                        .into(),
-                        argument: convert_type_to_data(args[1].clone(), &tuple_sub_types[1]).into(),
-                    };
+                    let term = apply_wrap(
+                        apply_wrap(
+                            DefaultFunction::MkPairData.into(),
+                            convert_type_to_data(args[0].clone(), &tuple_sub_types[0]),
+                        ),
+                        convert_type_to_data(args[1].clone(), &tuple_sub_types[1]),
+                    );
                     arg_stack.push(term);
                 } else {
                     let mut term = Term::Constant(UplcConstant::ProtoList(UplcType::Data, vec![]));
                     for (arg, tipo) in args.into_iter().zip(tuple_sub_types.into_iter()).rev() {
-                        term = Term::Apply {
-                            function: Term::Apply {
-                                function: Term::Builtin(DefaultFunction::MkCons)
-                                    .force_wrap()
-                                    .into(),
-                                argument: convert_type_to_data(arg, &tipo).into(),
-                            }
-                            .into(),
-                            argument: term.into(),
-                        };
+                        term = apply_wrap(
+                            apply_wrap(
+                                Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                convert_type_to_data(arg, &tipo),
+                            ),
+                            term,
+                        );
                     }
                     arg_stack.push(term);
                 }
             }
             Air::Todo { label, .. } => {
-                let term = Term::Apply {
-                    function: Term::Apply {
-                        function: Term::Builtin(DefaultFunction::Trace).force_wrap().into(),
-                        argument: Term::Constant(UplcConstant::String(
+                let term = apply_wrap(
+                    apply_wrap(
+                        Term::Builtin(DefaultFunction::Trace).force_wrap(),
+                        Term::Constant(UplcConstant::String(
                             label.unwrap_or_else(|| "aiken::todo".to_string()),
-                        ))
-                        .into(),
-                    }
-                    .into(),
-                    argument: Term::Delay(Term::Error.into()).into(),
-                }
+                        )),
+                    ),
+                    Term::Delay(Term::Error.into()),
+                )
                 .force_wrap();
 
                 arg_stack.push(term);
             }
-            Air::Record { .. } => todo!(),
-            Air::RecordUpdate { .. } => todo!(),
+            Air::RecordUpdate {
+                highest_index,
+                indices,
+                ..
+            } => {
+                let tail_name_prefix = "__tail_index".to_string();
+
+                let record = arg_stack.pop().unwrap();
+
+                let mut args = IndexMap::new();
+                let mut unchanged_field_indices = vec![];
+                let mut prev_index = 0;
+                for (index, tipo) in indices
+                    .iter()
+                    .sorted_by(|(index1, _), (index2, _)| index1.cmp(index2))
+                    .rev()
+                {
+                    let arg = arg_stack.pop().unwrap();
+                    args.insert(*index, (tipo.clone(), arg));
+
+                    for field_index in prev_index..*index {
+                        unchanged_field_indices.push(field_index);
+                    }
+                    prev_index = *index;
+                }
+
+                unchanged_field_indices.reverse();
+
+                let mut term = apply_wrap(
+                    Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                    Term::Var(Name {
+                        text: format!("{tail_name_prefix}_{highest_index}"),
+                        unique: 0.into(),
+                    }),
+                );
+
+                for current_index in (0..(highest_index + 1)).rev() {
+                    let tail_name = format!("{tail_name_prefix}_{current_index}");
+
+                    if let Some((tipo, arg)) = args.get(&current_index) {
+                        term = apply_wrap(
+                            apply_wrap(
+                                Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                convert_type_to_data(arg.clone(), tipo),
+                            ),
+                            term,
+                        );
+                    } else {
+                        term = apply_wrap(
+                            apply_wrap(
+                                Term::Builtin(DefaultFunction::MkCons).force_wrap(),
+                                apply_wrap(
+                                    Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                                    Term::Var(Name {
+                                        text: tail_name,
+                                        unique: 0.into(),
+                                    }),
+                                ),
+                            ),
+                            term,
+                        )
+                    }
+                }
+
+                term = apply_wrap(
+                    apply_wrap(
+                        Term::Builtin(DefaultFunction::ConstrData),
+                        Term::Constant(UplcConstant::Integer(0)),
+                    ),
+                    term,
+                );
+
+                if !unchanged_field_indices.is_empty() {
+                    prev_index = highest_index;
+                    for index in unchanged_field_indices.into_iter() {
+                        let tail_name = format!("{tail_name_prefix}_{}", prev_index);
+                        let prev_tail_name = format!("{tail_name_prefix}_{index}");
+
+                        let mut tail_list = Term::Var(Name {
+                            text: prev_tail_name,
+                            unique: 0.into(),
+                        });
+
+                        if index < prev_index {
+                            for _ in index..prev_index {
+                                tail_list = apply_wrap(
+                                    Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                                    tail_list,
+                                );
+                            }
+
+                            term = apply_wrap(
+                                Term::Lambda {
+                                    parameter_name: Name {
+                                        text: tail_name,
+                                        unique: 0.into(),
+                                    },
+                                    body: term.into(),
+                                },
+                                tail_list,
+                            );
+                        }
+                        prev_index = index;
+                    }
+                }
+                let tail_name = format!("{tail_name_prefix}_{prev_index}");
+                let prev_tail_name = format!("{tail_name_prefix}_0");
+
+                let mut tail_list = Term::Var(Name {
+                    text: prev_tail_name.clone(),
+                    unique: 0.into(),
+                });
+
+                for _ in 0..prev_index {
+                    tail_list = apply_wrap(
+                        Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                        tail_list,
+                    );
+                }
+                if prev_index != 0 {
+                    term = apply_wrap(
+                        Term::Lambda {
+                            parameter_name: Name {
+                                text: tail_name,
+                                unique: 0.into(),
+                            },
+                            body: term.into(),
+                        },
+                        tail_list,
+                    );
+                }
+
+                self.needs_field_access = true;
+                term = apply_wrap(
+                    Term::Lambda {
+                        parameter_name: Name {
+                            text: prev_tail_name,
+                            unique: 0.into(),
+                        },
+                        body: term.into(),
+                    },
+                    apply_wrap(
+                        Term::Var(Name {
+                            text: CONSTR_FIELDS_EXPOSER.to_string(),
+                            unique: 0.into(),
+                        }),
+                        record,
+                    ),
+                );
+                arg_stack.push(term);
+            }
             Air::UnOp { op, .. } => {
                 let value = arg_stack.pop().unwrap();
 
@@ -3947,23 +4452,24 @@ impl<'a> CodeGenerator<'a> {
                         Term::Constant(UplcConstant::Bool(false)),
                         Term::Constant(UplcConstant::Bool(true)),
                     ),
-                    UnOp::Negate => Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::SubtractInteger).into(),
-                            argument: Term::Constant(UplcConstant::Integer(0)).into(),
-                        }
-                        .into(),
-                        argument: value.into(),
-                    },
+                    UnOp::Negate => apply_wrap(
+                        apply_wrap(
+                            DefaultFunction::SubtractInteger.into(),
+                            Term::Constant(UplcConstant::Integer(0)),
+                        ),
+                        value,
+                    ),
                 };
 
                 arg_stack.push(term);
             }
-            Air::TupleIndex { tipo, index, .. } => {
+            Air::TupleIndex {
+                tipo, tuple_index, ..
+            } => {
                 let mut term = arg_stack.pop().unwrap();
 
                 if matches!(tipo.get_uplc_type(), UplcType::Pair(_, _)) {
-                    if index == 0 {
+                    if tuple_index == 0 {
                         term = convert_data_to_type(
                             apply_wrap(
                                 Term::Builtin(DefaultFunction::FstPair)
@@ -3994,7 +4500,7 @@ impl<'a> CodeGenerator<'a> {
                             }),
                             term,
                         ),
-                        Term::Constant(UplcConstant::Integer(index as i128)),
+                        Term::Constant(UplcConstant::Integer(tuple_index as i128)),
                     );
                 }
 
@@ -4007,67 +4513,58 @@ impl<'a> CodeGenerator<'a> {
                 let list_id = self.id_gen.next();
 
                 if names.len() == 2 {
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: format!("__tuple_{}", list_id),
                                 unique: 0.into(),
                             },
-                            body: Term::Apply {
-                                function: Term::Lambda {
+                            body: apply_wrap(
+                                Term::Lambda {
                                     parameter_name: Name {
                                         text: names[0].clone(),
                                         unique: 0.into(),
                                     },
-                                    body: Term::Apply {
-                                        function: Term::Lambda {
+                                    body: apply_wrap(
+                                        Term::Lambda {
                                             parameter_name: Name {
                                                 text: names[1].clone(),
                                                 unique: 0.into(),
                                             },
                                             body: term.into(),
-                                        }
-                                        .into(),
-                                        argument: convert_data_to_type(
-                                            Term::Apply {
-                                                function: Term::Builtin(DefaultFunction::SndPair)
+                                        },
+                                        convert_data_to_type(
+                                            apply_wrap(
+                                                Term::Builtin(DefaultFunction::SndPair)
                                                     .force_wrap()
-                                                    .force_wrap()
-                                                    .into(),
-                                                argument: Term::Var(Name {
+                                                    .force_wrap(),
+                                                Term::Var(Name {
                                                     text: format!("__tuple_{}", list_id),
                                                     unique: 0.into(),
-                                                })
-                                                .into(),
-                                            },
+                                                }),
+                                            ),
                                             &inner_types[1],
-                                        )
-                                        .into(),
-                                    }
+                                        ),
+                                    )
                                     .into(),
-                                }
-                                .into(),
-                                argument: convert_data_to_type(
-                                    Term::Apply {
-                                        function: Term::Builtin(DefaultFunction::FstPair)
+                                },
+                                convert_data_to_type(
+                                    apply_wrap(
+                                        Term::Builtin(DefaultFunction::FstPair)
                                             .force_wrap()
-                                            .force_wrap()
-                                            .into(),
-                                        argument: Term::Var(Name {
+                                            .force_wrap(),
+                                        Term::Var(Name {
                                             text: format!("__tuple_{}", list_id),
                                             unique: 0.into(),
-                                        })
-                                        .into(),
-                                    },
+                                        }),
+                                    ),
                                     &inner_types[0],
-                                )
-                                .into(),
-                            }
+                                ),
+                            )
                             .into(),
-                        }
-                        .into(),
-                        argument: value.into(),
-                    };
+                        },
+                        value,
+                    );
                 } else {
                     let mut id_list = vec![];
 
@@ -4079,63 +4576,53 @@ impl<'a> CodeGenerator<'a> {
                     let (first_name, names) = names.split_first().unwrap();
 
                     let head_list = convert_data_to_type(
-                        Term::Apply {
-                            function: Term::Force(Term::Builtin(DefaultFunction::HeadList).into())
-                                .into(),
-                            argument: Term::Var(Name {
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::HeadList).force_wrap(),
+                            Term::Var(Name {
                                 text: format!("__tuple_{}", list_id),
                                 unique: 0.into(),
-                            })
-                            .into(),
-                        },
+                            }),
+                        ),
                         &tipo.get_inner_types()[0],
                     );
 
-                    term = Term::Apply {
-                        function: Term::Lambda {
+                    term = apply_wrap(
+                        Term::Lambda {
                             parameter_name: Name {
                                 text: format!("__tuple_{}", list_id),
                                 unique: 0.into(),
                             },
-                            body: Term::Apply {
-                                function: Term::Lambda {
+                            body: apply_wrap(
+                                Term::Lambda {
                                     parameter_name: Name {
                                         text: first_name.clone(),
                                         unique: 0.into(),
                                     },
-                                    body: Term::Apply {
-                                        function: list_access_to_uplc(
+                                    body: apply_wrap(
+                                        list_access_to_uplc(
                                             names,
                                             &id_list,
                                             false,
                                             current_index,
                                             term,
                                             &tipo,
-                                        )
-                                        .into(),
-                                        argument: Term::Apply {
-                                            function: Term::Force(
-                                                Term::Builtin(DefaultFunction::TailList).into(),
-                                            )
-                                            .into(),
-                                            argument: Term::Var(Name {
+                                        ),
+                                        apply_wrap(
+                                            Term::Builtin(DefaultFunction::TailList).force_wrap(),
+                                            Term::Var(Name {
                                                 text: format!("__tuple_{}", list_id),
                                                 unique: 0.into(),
-                                            })
-                                            .into(),
-                                        }
-                                        .into(),
-                                    }
+                                            }),
+                                        ),
+                                    )
                                     .into(),
-                                }
-                                .into(),
-                                argument: head_list.into(),
-                            }
+                                },
+                                head_list,
+                            )
                             .into(),
-                        }
-                        .into(),
-                        argument: value.into(),
-                    };
+                        },
+                        value,
+                    );
                 }
 
                 arg_stack.push(term);
@@ -4143,30 +4630,27 @@ impl<'a> CodeGenerator<'a> {
             Air::Trace { text, .. } => {
                 let term = arg_stack.pop().unwrap();
 
-                let term = Term::Apply {
-                    function: Term::Apply {
-                        function: Term::Builtin(DefaultFunction::Trace).force_wrap().into(),
-                        argument: Term::Constant(UplcConstant::String(
+                let term = apply_wrap(
+                    apply_wrap(
+                        Term::Builtin(DefaultFunction::Trace).force_wrap(),
+                        Term::Constant(UplcConstant::String(
                             text.unwrap_or_else(|| "aiken::trace".to_string()),
-                        ))
-                        .into(),
-                    }
-                    .into(),
-                    argument: term.into(),
-                };
+                        )),
+                    ),
+                    term,
+                );
 
                 arg_stack.push(term);
             }
             Air::ErrorTerm { label, .. } => {
                 if let Some(label) = label {
-                    let term = Term::Apply {
-                        function: Term::Apply {
-                            function: Term::Builtin(DefaultFunction::Trace).force_wrap().into(),
-                            argument: Term::Constant(UplcConstant::String(label)).into(),
-                        }
-                        .into(),
-                        argument: Term::Delay(Term::Error.into()).into(),
-                    }
+                    let term = apply_wrap(
+                        apply_wrap(
+                            Term::Builtin(DefaultFunction::Trace).force_wrap(),
+                            Term::Constant(UplcConstant::String(label)),
+                        ),
+                        Term::Delay(Term::Error.into()),
+                    )
                     .force_wrap();
 
                     arg_stack.push(term);

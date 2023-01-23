@@ -23,8 +23,9 @@ jobs:
       run: cargo test --verbose --workspace
     - name: Run acceptance tests
       working-directory: examples/acceptance_tests
-      run: find . -maxdepth 1 -mindepth 1 -type d -exec ./run {} \;
-    - name: Lint
+      run: bash ci
+      shell: bash
+    - name: Format
       run: cargo fmt --all -- --check
     - name: Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings

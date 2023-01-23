@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
 
-use super::error::Error;
+use super::error::{Error, UnknownLabels};
 use crate::ast::{CallArg, Span};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,12 +27,14 @@ impl FieldMap {
                 if self.is_function {
                     Err(Error::DuplicateArgument {
                         label,
-                        locations: vec![*location, location_other],
+                        location: *location,
+                        duplicate_location: location_other,
                     })
                 } else {
                     Err(Error::DuplicateField {
                         label,
-                        locations: vec![*location, location_other],
+                        location: *location,
+                        duplicate_location: location_other,
                     })
                 }
             }
@@ -102,27 +104,24 @@ impl FieldMap {
                 }
             };
 
-            let (position, other_location) = match self.fields.get(label) {
+            let (position, duplicate_location) = match self.fields.get(label) {
                 None => {
-                    unknown_labels.push((label.clone(), location));
-
+                    unknown_labels.push(location);
                     i += 1;
-
                     continue;
                 }
-
                 Some(&p) => p,
             };
 
             // If the argument is already in the right place
             if position == i {
                 seen_labels.insert(label.clone());
-
                 i += 1;
             } else {
                 if seen_labels.contains(label) {
                     return Err(Error::DuplicateArgument {
-                        locations: vec![location, other_location],
+                        location,
+                        duplicate_location,
                         label: label.to_string(),
                     });
                 }
@@ -136,13 +135,13 @@ impl FieldMap {
         if unknown_labels.is_empty() {
             Ok(())
         } else {
-            let valid = self.fields.keys().map(|t| t.to_string()).collect();
+            let valid = self.fields.keys().map(|t| t.to_string()).sorted().collect();
 
-            Err(Error::UnknownLabels {
+            Err(Error::UnknownLabels(vec![UnknownLabels {
                 valid,
                 unknown: unknown_labels,
                 supplied: seen_labels.into_iter().collect(),
-            })
+            }]))
         }
     }
 

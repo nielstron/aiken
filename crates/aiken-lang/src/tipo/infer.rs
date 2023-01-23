@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     ast::{
         DataType, Definition, Function, Layer, ModuleConstant, ModuleKind, RecordConstructor,
-        RecordConstructorArg, TypeAlias, TypedDefinition, TypedModule, UntypedDefinition,
+        RecordConstructorArg, Span, TypeAlias, TypedDefinition, TypedModule, UntypedDefinition,
         UntypedModule, Use,
     },
     builtins,
@@ -57,7 +57,7 @@ impl UntypedModule {
 
         // Register values so they can be used in functions earlier in the module.
         for def in self.definitions() {
-            environment.register_values(def, &name, &mut hydrators, &mut value_names)?;
+            environment.register_values(def, &name, &mut hydrators, &mut value_names, kind)?;
         }
 
         // Infer the types of each definition in the module
@@ -79,7 +79,7 @@ impl UntypedModule {
         }
 
         for def in consts.into_iter().chain(not_consts) {
-            let definition = infer_definition(def, &name, &mut hydrators, &mut environment)?;
+            let definition = infer_definition(def, &name, &mut hydrators, &mut environment, kind)?;
 
             definitions.push(definition);
         }
@@ -145,6 +145,7 @@ fn infer_definition(
     module_name: &String,
     hydrators: &mut HashMap<String, Hydrator>,
     environment: &mut Environment<'_>,
+    kind: ModuleKind,
 ) -> Result<TypedDefinition, Error> {
     match def {
         Definition::Fn(Function {
@@ -158,6 +159,15 @@ fn infer_definition(
             end_position,
             ..
         }) => {
+            if public && kind.is_validator() {
+                environment.warnings.push(Warning::PubInValidatorModule {
+                    location: Span {
+                        start: location.start,
+                        end: location.start + 3,
+                    },
+                })
+            }
+
             let preregistered_fn = environment
                 .get_variable(&name)
                 .expect("Could not find preregistered type for function");
@@ -194,7 +204,7 @@ fn infer_definition(
 
                     let safe_to_generalise = !expr_typer.ungeneralised_function_used;
 
-                    Ok((tipo, args, body, safe_to_generalise))
+                    Ok::<_, Error>((tipo, args, body, safe_to_generalise))
                 })?;
 
             // Assert that the inferred type matches the type of any recursive call
@@ -239,7 +249,7 @@ fn infer_definition(
 
         Definition::Test(f) => {
             if let Definition::Fn(f) =
-                infer_definition(Definition::Fn(f), module_name, hydrators, environment)?
+                infer_definition(Definition::Fn(f), module_name, hydrators, environment, kind)?
             {
                 environment.unify(f.return_type.clone(), builtins::bool(), f.location)?;
                 Ok(Definition::Test(f))
@@ -257,6 +267,15 @@ fn infer_definition(
             annotation,
             ..
         }) => {
+            if public && kind.is_validator() {
+                environment.warnings.push(Warning::PubInValidatorModule {
+                    location: Span {
+                        start: location.start,
+                        end: location.start + 3,
+                    },
+                })
+            }
+
             let tipo = environment
                 .get_type_constructor(&None, &alias, location)
                 .expect("Could not find existing type for type alias")
@@ -281,10 +300,19 @@ fn infer_definition(
             opaque,
             name,
             parameters,
-            constructors,
+            constructors: untyped_constructors,
             ..
         }) => {
-            let constructors = constructors
+            if public && kind.is_validator() {
+                environment.warnings.push(Warning::PubInValidatorModule {
+                    location: Span {
+                        start: location.start,
+                        end: location.start + 3,
+                    },
+                })
+            }
+
+            let constructors = untyped_constructors
                 .into_iter()
                 .map(
                     |RecordConstructor {
@@ -346,7 +374,7 @@ fn infer_definition(
                 .parameters
                 .clone();
 
-            Ok(Definition::DataType(DataType {
+            let typed_data = DataType {
                 doc,
                 location,
                 public,
@@ -355,7 +383,19 @@ fn infer_definition(
                 parameters,
                 constructors,
                 typed_parameters,
-            }))
+            };
+
+            for constr in &typed_data.constructors {
+                for RecordConstructorArg { tipo, location, .. } in &constr.arguments {
+                    if tipo.is_function() {
+                        return Err(Error::FunctionTypeInData {
+                            location: *location,
+                        });
+                    }
+                }
+            }
+
+            Ok(Definition::DataType(typed_data))
         }
 
         Definition::Use(Use {
@@ -405,6 +445,15 @@ fn infer_definition(
             value,
             ..
         }) => {
+            if public && kind.is_validator() {
+                environment.warnings.push(Warning::PubInValidatorModule {
+                    location: Span {
+                        start: location.start,
+                        end: location.start + 3,
+                    },
+                })
+            }
+
             let typed_expr = ExprTyper::new(environment).infer_const(&annotation, *value)?;
 
             let tipo = typed_expr.tipo();

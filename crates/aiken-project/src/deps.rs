@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::{
-    config::{Config, Dependency, PackageName},
+    config::{Config, Dependency},
     error::Error,
+    package_name::PackageName,
     paths,
     telemetry::{Event, EventListener},
 };
@@ -134,7 +135,6 @@ impl From<&Manifest> for LocalPackages {
 
 pub fn download<T>(
     event_listener: &T,
-    new_package: Option<Vec<String>>,
     use_manifest: UseManifest,
     root_path: &Path,
     config: &Config,
@@ -161,16 +161,6 @@ where
     }
 
     let project_name = config.name.clone();
-
-    if let Some(packages) = new_package {
-        for _package in packages {
-            // config.dependencies.push(Dependency {
-            //     name: (),
-            //     version: (),
-            //     source: package.sour,
-            // })
-        }
-    }
 
     let runtime = tokio::runtime::Runtime::new().expect("Unable to start Tokio");
 
