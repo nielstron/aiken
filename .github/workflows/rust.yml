@@ -10,13 +10,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  update-cargonix:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Run cargo2nix
+      run: |
+        nix run github:cargo2nix/cargo2nix
+    - name: Commit Cargo.nix
+      run: |
+        git add Cargo.nix
+        git commit -m "Bumping Cargo.nix to latest Cargo.lock"
+        git push origin/flake flake
   build:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
-    - uses: cachix/install-nix-action@v18
-    - name: Environment
-      run: nix develop .#aiken
     - name: Build
       run: cargo build --verbose --workspace
     - name: Run unit tests
