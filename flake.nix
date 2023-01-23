@@ -24,6 +24,21 @@
           aiken = (rustPkgs.workspace.aiken {}).bin;
           default = packages.aiken;
         };
+        devShell = pkgs.devshell.mkShell {
+          commands = [{
+            name = "aiken";
+            category = "Tools for aiken development";
+            command =
+              "cargo run --";
+          }
+          {
+            name = "uplc";
+            category = "Tools for aiken development";
+            command =
+              "cargo run -- uplc";
+          }
+          ];
+        };
       }
     );
 }
